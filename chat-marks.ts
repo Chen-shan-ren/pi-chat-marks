@@ -669,8 +669,17 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    // 等 transcript 布局渲染完成后，初始同步一次视口指示（恢复会话时定位到当前视口）
-    setTimeout(() => updateViewportIndicator(), 200);
+    // 等 transcript 布局渲染完成后：强制滚到底部并同步视口指示。
+    // 修复：点击跳转（或手动滚动）后 followingEnd 被破坏，/resume 切换会话时
+    // pi 复用 ScrollView 且不重置滚动位置，导致新会话停在中间而非底部。
+    setTimeout(() => {
+      try {
+        (dotsTui as unknown as { scrollToBottom?(): void } | undefined)?.scrollToBottom?.();
+      } catch {
+        // 忽略
+      }
+      updateViewportIndicator();
+    }, 200);
   });
 
   pi.on("message_end", (event) => {
