@@ -405,15 +405,21 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** 对 tui-alt-screen.js 应用幂等补丁：patch 未生效（含标记）时替换 anchor。 */
+  // 注意：TUI 模式下 console.* 会直接污染终端屏幕（扩展重载时重新打印），
+  // 因此补丁日志全部静默，仅在显式调试（CHAT_MARKS_DEBUG=1）时输出。
+  const debug = process.env.CHAT_MARKS_DEBUG === "1";
+  const log = debug ? (msg: string) => console.log(msg) : () => {};
+  const warn = debug ? (msg: string) => console.warn(msg) : () => {};
+
   function applyIdempotentPatch(file: string, mark: string, anchor: string, insert: string, label: string): void {
     const src = readFileSync(file, "utf8");
     if (src.includes(mark)) return; // 已打过补丁
     if (!src.includes(anchor)) {
-      console.warn(`[chat-marks] tui-alt-screen.js 版本不匹配，无法打补丁（${label}）`);
+      warn(`[chat-marks] tui-alt-screen.js 版本不匹配，无法打补丁（${label}）`);
       return;
     }
     writeFileSync(file, src.replace(anchor, insert), "utf8");
-    console.log(`[chat-marks] 已打补丁（${label}）:`, file);
+    log(`[chat-marks] 已打补丁（${label}）:`, file);
   }
 
   /** 幂等补丁：插入鼠标钩子调用点、滚动钩子调用点，并放开非捕获 overlay 对滚动条/选择的禁用。 */
@@ -421,7 +427,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const file = findTuiAltScreenPath();
       if (!file) {
-        console.warn("[chat-marks] 未找到 tui-alt-screen.js，鼠标交互不可用（键盘路径 Ctrl+Alt+M 仍可用）");
+        warn("[chat-marks] 未找到 tui-alt-screen.js，鼠标交互不可用（键盘路径 Ctrl+Alt+M 仍可用）");
       } else {
         applyIdempotentPatch(file, PATCH_MARK, PATCH_ANCHOR, PATCH_INSERT, "鼠标钩子");
         applyIdempotentPatch(file, PATCH2_MARK, PATCH2_ANCHOR, PATCH2_INSERT, "滚动条守卫");
@@ -429,13 +435,13 @@ export default function (pi: ExtensionAPI) {
       }
       const scrollFile = findScrollViewPath();
       if (!scrollFile) {
-        console.warn("[chat-marks] 未找到 scroll-view.js，视口位置指示不可用");
+        warn("[chat-marks] 未找到 scroll-view.js，视口位置指示不可用");
       } else {
         applyIdempotentPatch(scrollFile, PATCH4_MARK, PATCH4_ANCHOR, PATCH4_INSERT, "滚动钩子 scrollTo");
         applyIdempotentPatch(scrollFile, PATCH5_MARK, PATCH5_ANCHOR, PATCH5_INSERT, "滚动钩子 scrollBy");
       }
     } catch (err) {
-      console.warn("[chat-marks] 打补丁失败:", err instanceof Error ? err.message : String(err));
+      warn("[chat-marks] 打补丁失败:", err instanceof Error ? err.message : String(err));
     }
   }
 
