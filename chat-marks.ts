@@ -62,6 +62,7 @@ export default function (pi: ExtensionAPI) {
   let messages: UserMsg[] = [];
   let selectedIndex = -1; // 键盘索引当前选中（点列高亮）
   let hoverIndex = -1; // 鼠标悬停的点
+  let viewportIndex = -1; // 当前视口位置对应的消息（随 transcript 滚动联动）
   let scrollOffset = 0; // 点列滚动偏移（消息多时）
   let sessionCtx: ExtensionContext | undefined;
   let dotsTui: { requestRender(): void } | undefined;
@@ -148,9 +149,13 @@ export default function (pi: ExtensionAPI) {
       if (i === hoverIndex) {
         // 悬停：最大点 + 反色背景 + 高亮色，与普通点对比强烈
         dot = theme.bold(theme.fg("accent", theme.bg("selectedBg", "⬤")));
+      } else if (i === viewportIndex) {
+        // 视口位置：黄色中号点（随 transcript 滚动联动）
+        dot = theme.fg("warning", "◉");
       } else if (i === selectedIndex) {
         dot = theme.fg("accent", "◉");
       } else if (i === messages.length - 1) {
+        // 最新（end）消息：绿色
         dot = theme.fg("success", "●");
       } else {
         // 普通：小点，避免视觉噪点
@@ -159,6 +164,49 @@ export default function (pi: ExtensionAPI) {
       rows.push(width > 1 ? " " + dot : dot);
     }
     return rows;
+  }
+
+  /**
+   * 视口位置指示：读取 transcript 滚动位置，找到视口中线对应的用户消息标记行，
+   * 更新 viewportIndex（点列中的黄色 ◉）。所有滚动（鼠标滚轮/键盘/滚动条/搜索）
+   * 都会经过 ScrollView.scrollTo/scrollBy（补丁注入 __piScrollHook）。
+   */
+  function updateViewportIndicator(): void {
+    const t = dotsTui as unknown as {
+      currentLayout?: unknown;
+      getPrimaryScrollView?(): {
+        scrollTop: number;
+        viewportHeight: number;
+      };
+      requestRender(): void;
+    } | undefined;
+    if (!t?.getPrimaryScrollView || !t.currentLayout) return;
+    const sv = t.getPrimaryScrollView();
+    const box = findScrollViewBox(t.currentLayout, sv);
+    const lines = box?.scrollContentLines;
+    if (!lines || lines.length === 0) return;
+    const mid = Math.min(sv.scrollTop + Math.floor(sv.viewportHeight / 2), lines.length - 1);
+    // 从视口中线向上找最近的用户消息标记行
+    let markRow = -1;
+    for (let row = mid; row >= 0; row--) {
+      if (OSC133_PROMPT_START.test(lines[row] ?? "")) {
+        markRow = row;
+        break;
+      }
+    }
+    let next = -1;
+    if (markRow >= 0) {
+      // 标记行顺序 = 消息渲染顺序 = messages 顺序，数出是第几条
+      let k = 0;
+      for (let row = 0; row < markRow; row++) {
+        if (OSC133_PROMPT_START.test(lines[row] ?? "")) k++;
+      }
+      next = k < messages.length ? k : -1;
+    }
+    if (next !== viewportIndex) {
+      viewportIndex = next;
+      t.requestRender();
+    }
   }
 
   // ---- 跳转到指定用户消息 ----
@@ -285,6 +333,18 @@ export default function (pi: ExtensionAPI) {
     "        const scrollView = !this.getTopmostVisibleOverlay() && this.currentLayout\n" +
     "            ? getScrollViewsAt(this.currentLayout, event.x, event.y)[0]\n" +
     "            : undefined;";
+  // 滚动钩子补丁（scroll-view.js）：所有滚动（鼠标滚轮/键盘/滚动条/搜索/自动跟随）
+  // 都汇聚到 ScrollView.scrollTo/scrollBy，在其末尾通知扩展（视口位置指示联动）。
+  const PATCH4_MARK = "__piScrollHook";
+  const PATCH4_ANCHOR =
+    "        if (moved)\n            this.markScrollbarActivity();\n        this.requestRenderCallback?.();\n    }\n    scrollBy(lines) {";
+  const PATCH4_INSERT =
+    "        if (moved)\n            this.markScrollbarActivity();\n        this.requestRenderCallback?.();\n        globalThis.__piScrollHook?.(this);\n    }\n    scrollBy(lines) {";
+  const PATCH5_MARK = "__piScrollHookBy";
+  const PATCH5_ANCHOR =
+    "        if (moved !== 0 || this.followingEnd !== wasFollowingEnd)\n            this.requestRenderCallback?.();\n        return requested - moved;";
+  const PATCH5_INSERT =
+    "        if (moved !== 0 || this.followingEnd !== wasFollowingEnd)\n            this.requestRenderCallback?.();\n        // [chat-marks-patch] __piScrollHookBy: scrollBy hook\n        globalThis.__piScrollHook?.(this);\n        return requested - moved;";
 
   function findTuiAltScreenPath(): string | undefined {
     const candidates: string[] = [];
@@ -307,6 +367,14 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
+  /** scroll-view.js 与 tui-alt-screen.js 同目录（../components/scroll-view.js） */
+  function findScrollViewPath(): string | undefined {
+    const alt = findTuiAltScreenPath();
+    if (!alt) return undefined;
+    const p = join(dirname(alt), "components", "scroll-view.js");
+    return existsSync(p) ? p : undefined;
+  }
+
   /** 对 tui-alt-screen.js 应用幂等补丁：patch 未生效（含标记）时替换 anchor。 */
   function applyIdempotentPatch(file: string, mark: string, anchor: string, insert: string, label: string): void {
     const src = readFileSync(file, "utf8");
@@ -319,17 +387,24 @@ export default function (pi: ExtensionAPI) {
     console.log(`[chat-marks] 已打补丁（${label}）:`, file);
   }
 
-  /** 幂等补丁：插入鼠标钩子调用点，并放开非捕获 overlay 对滚动条/选择的禁用。 */
+  /** 幂等补丁：插入鼠标钩子调用点、滚动钩子调用点，并放开非捕获 overlay 对滚动条/选择的禁用。 */
   function ensureAltScreenPatches(): void {
     try {
       const file = findTuiAltScreenPath();
       if (!file) {
         console.warn("[chat-marks] 未找到 tui-alt-screen.js，鼠标交互不可用（键盘路径 Ctrl+Alt+M 仍可用）");
-        return;
+      } else {
+        applyIdempotentPatch(file, PATCH_MARK, PATCH_ANCHOR, PATCH_INSERT, "鼠标钩子");
+        applyIdempotentPatch(file, PATCH2_MARK, PATCH2_ANCHOR, PATCH2_INSERT, "滚动条守卫");
+        applyIdempotentPatch(file, PATCH3_MARK, PATCH3_ANCHOR, PATCH3_INSERT, "选择守卫");
       }
-      applyIdempotentPatch(file, PATCH_MARK, PATCH_ANCHOR, PATCH_INSERT, "鼠标钩子");
-      applyIdempotentPatch(file, PATCH2_MARK, PATCH2_ANCHOR, PATCH2_INSERT, "滚动条守卫");
-      applyIdempotentPatch(file, PATCH3_MARK, PATCH3_ANCHOR, PATCH3_INSERT, "选择守卫");
+      const scrollFile = findScrollViewPath();
+      if (!scrollFile) {
+        console.warn("[chat-marks] 未找到 scroll-view.js，视口位置指示不可用");
+      } else {
+        applyIdempotentPatch(scrollFile, PATCH4_MARK, PATCH4_ANCHOR, PATCH4_INSERT, "滚动钩子 scrollTo");
+        applyIdempotentPatch(scrollFile, PATCH5_MARK, PATCH5_ANCHOR, PATCH5_INSERT, "滚动钩子 scrollBy");
+      }
     } catch (err) {
       console.warn("[chat-marks] 打补丁失败:", err instanceof Error ? err.message : String(err));
     }
@@ -523,6 +598,10 @@ export default function (pi: ExtensionAPI) {
     // 安装鼠标钩子（alt-screen 的 handleViewportInput 会先调用它）
     (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = (data: string, tui: unknown) =>
       handleMouse(data, tui as never);
+    // 安装滚动钩子（ScrollView.scrollTo/scrollBy 末尾调用，视口指示联动）
+    (globalThis as unknown as Record<string, unknown>)["__piScrollHook"] = () => {
+      updateViewportIndicator();
+    };
 
     try {
       for (const entry of ctx.sessionManager.getEntries()) {
@@ -560,6 +639,9 @@ export default function (pi: ExtensionAPI) {
         nonCapturing: true,
       },
     });
+
+    // 等 transcript 布局渲染完成后，初始同步一次视口指示（恢复会话时定位到当前视口）
+    setTimeout(() => updateViewportIndicator(), 200);
   });
 
   pi.on("message_end", (event) => {
@@ -573,10 +655,13 @@ export default function (pi: ExtensionAPI) {
     });
     clampOffset();
     dotsTui?.requestRender();
+    // 新消息加入后内容变化，重新同步视口指示
+    setTimeout(() => updateViewportIndicator(), 100);
   });
 
   pi.on("session_shutdown", () => {
     (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = undefined;
+    (globalThis as unknown as Record<string, unknown>)["__piScrollHook"] = undefined;
     sessionCtx = undefined;
   });
 
