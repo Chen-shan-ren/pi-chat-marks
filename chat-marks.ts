@@ -66,6 +66,7 @@ export default function (pi: ExtensionAPI) {
   let scrollOffset = 0; // 点列滚动偏移（消息多时）
   let sessionCtx: ExtensionContext | undefined;
   let dotsTui: { requestRender(): void } | undefined;
+  let rowMapCache: { lines: string[]; map: Map<number, number> } | undefined; // 标记行→消息索引映射缓存
 
   // ---- 工具函数 ----
 
@@ -167,9 +168,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 视口位置指示：读取 transcript 滚动位置，找到视口中线对应的用户消息标记行，
-   * 更新 viewportIndex（点列中的黄色 ◉）。所有滚动（鼠标滚轮/键盘/滚动条/搜索）
-   * 都会经过 ScrollView.scrollTo/scrollBy（补丁注入 __piScrollHook）。
+   * 视口位置指示：读取 transcript 滚动位置，通过映射表找到视口中线对应的消息，
+   * 更新 viewportIndex（点列中的黄色 ◉），并让点列窗口跟随视口。所有滚动（鼠标
+   * 滚轮/键盘/滚动条/搜索）都会经过 ScrollView.scrollTo/scrollBy（补丁注入 __piScrollHook）。
    */
   function updateViewportIndicator(): void {
     const t = dotsTui as unknown as {
@@ -186,27 +187,21 @@ export default function (pi: ExtensionAPI) {
     const lines = box?.scrollContentLines;
     if (!lines || lines.length === 0) return;
     const mid = Math.min(sv.scrollTop + Math.floor(sv.viewportHeight / 2), lines.length - 1);
-    // 从视口中线向上找最近的用户消息标记行
+    // 从视口中线向上找最近的、能映射到消息的标记行（跳过图片消息等无文本标记）
+    const map = getRowMap(lines);
     let markRow = -1;
     for (let row = mid; row >= 0; row--) {
-      if (OSC133_PROMPT_START.test(lines[row] ?? "")) {
+      if (OSC133_PROMPT_START.test(lines[row] ?? "") && map.has(row)) {
         markRow = row;
         break;
       }
     }
-    let next = -1;
-    if (markRow >= 0) {
-      // 标记行顺序 = 消息渲染顺序 = messages 顺序，数出是第几条
-      let k = 0;
-      for (let row = 0; row < markRow; row++) {
-        if (OSC133_PROMPT_START.test(lines[row] ?? "")) k++;
-      }
-      next = k < messages.length ? k : -1;
-    }
+    const next = markRow >= 0 ? (map.get(markRow) ?? -1) : -1;
     if (next !== viewportIndex) {
       viewportIndex = next;
       t.requestRender();
     }
+    syncWindowToViewport();
   }
 
   // ---- 跳转到指定用户消息 ----
@@ -227,7 +222,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 判断一个渲染行是否为"目标消息"的首行：
+   * 判断一个渲染行是否为某条消息的首行：
    * - 短消息（首行能容纳全文）：要求整行文本与消息文本完全一致
    * - 长消息（首行只是开头）：要求首行（≥4 字符）是消息文本的前缀
    */
@@ -235,6 +230,64 @@ export default function (pi: ExtensionAPI) {
     if (!visible) return false;
     if (targetText.length <= visible.length) return visible === targetText;
     return visible.length >= 4 && targetText.startsWith(visible);
+  }
+
+  /**
+   * 构建“渲染标记行 → messages 索引”的精确映射。
+   * 不能用标记行序号直接当消息索引：messages 只收集有文本的用户消息，
+   * 图片消息/空文本消息在渲染中有标记行但没有对应条目；文本也可能重复。
+   * 算法：游标贪心匹配——每个标记行取首段可见文本，从上次匹配位置之后找第一条
+   * 文本匹配的消息（文本匹配失败说明该标记行对应图片/空消息，跳过）。
+   */
+  function buildRowMap(lines: string[]): Map<number, number> {
+    const map = new Map<number, number>();
+    let cursor = 0;
+    for (let row = 0; row < lines.length; row++) {
+      if (!OSC133_PROMPT_START.test(lines[row] ?? "")) continue;
+      let visible = stripAnsi(lines[row] ?? "");
+      if (!visible) {
+        for (let r2 = row + 1; r2 < lines.length; r2++) {
+          if (OSC133_PROMPT_START.test(lines[r2] ?? "")) break;
+          visible = stripAnsi(lines[r2] ?? "");
+          if (visible) break;
+        }
+      }
+      if (!visible) continue;
+      for (let j = cursor; j < messages.length; j++) {
+        if (matchesPromptRow(visible, messages[j].text.trim())) {
+          map.set(row, j);
+          cursor = j + 1;
+          break;
+        }
+      }
+    }
+    return map;
+  }
+
+  function getRowMap(lines: string[]): Map<number, number> {
+    if (rowMapCache && rowMapCache.lines === lines) return rowMapCache.map;
+    const map = buildRowMap(lines);
+    rowMapCache = { lines, map };
+    return map;
+  }
+
+  /** 点列窗口跟随视口：目标消息不在可见窗口时滑动窗口，让黄色指示点始终可见；
+   *  视口位于最近 count 条内时窗口回到最新（保持绿色最新点可见）。 */
+  function syncWindowToViewport(): void {
+    const count = dotsCount();
+    if (count <= 0 || viewportIndex < 0) return;
+    const maxOffset = Math.max(0, messages.length - count);
+    if (viewportIndex >= scrollOffset && viewportIndex < scrollOffset + count) return;
+    let target: number;
+    if (viewportIndex >= messages.length - count) {
+      target = maxOffset; // 视口在最近 count 条内 → 显示最新窗口
+    } else {
+      target = Math.max(0, Math.min(maxOffset, viewportIndex - Math.floor(count / 2)));
+    }
+    if (target !== scrollOffset) {
+      scrollOffset = target;
+      dotsTui?.requestRender();
+    }
   }
 
   /** 在渲染行中定位第 index 条用户消息并滚动过去。返回是否成功。 */
@@ -252,42 +305,18 @@ export default function (pi: ExtensionAPI) {
     if (!lines || lines.length === 0) return false;
     const target = messages[index];
     if (!target) return false;
-    const targetText = target.text.trim();
-    if (!targetText) return false;
 
-    // 前面还有几条消息的首行与目标相同（重复消息场景），需要跳过对应次数
-    const prefix = targetText.slice(0, 12);
-    let occ = 0;
-    for (let i = 0; i < index; i++) {
-      if (messages[i].text.trim().startsWith(prefix)) occ++;
-    }
-
-    let seen = 0;
+    // 精确映射表定位（不依赖文本计数，杜绝重复消息错位）
+    const map = getRowMap(lines);
     let matchRow = -1;
-    for (let row = 0; row < lines.length; row++) {
-      if (!OSC133_PROMPT_START.test(lines[row] ?? "")) continue;
-      // 标记行本身可能是 padding 空行（用户/助手消息首行均为空 padding），
-      // 取该消息的第一段可见文本：标记行本身，或其后到下一条消息标记前的第一行非空文本
-      let visible = stripAnsi(lines[row] ?? "");
-      if (!visible) {
-        for (let r2 = row + 1; r2 < lines.length; r2++) {
-          if (OSC133_PROMPT_START.test(lines[r2] ?? "")) break; // 遇到下一条消息
-          visible = stripAnsi(lines[r2] ?? "");
-          if (visible) break;
-        }
-      }
-      if (!visible) continue;
-      if (matchesPromptRow(visible, targetText)) {
-        if (seen === occ) {
-          matchRow = row;
-          break;
-        }
-        seen++;
+    for (const [row, msgIndex] of map) {
+      if (msgIndex === index) {
+        matchRow = row;
+        break;
       }
     }
-    if (matchRow < 0) {
-      return false;
-    }
+    if (matchRow < 0) return false;
+
     sv.scrollTo(matchRow);
     t.requestRender();
     t.flash?.(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, 1500);
@@ -653,6 +682,7 @@ export default function (pi: ExtensionAPI) {
       timestamp: event.message.timestamp ?? Date.now(),
       text,
     });
+    rowMapCache = undefined; // 内容变化，标记行映射失效
     clampOffset();
     dotsTui?.requestRender();
     // 新消息加入后内容变化，重新同步视口指示
