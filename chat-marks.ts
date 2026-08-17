@@ -699,6 +699,14 @@ export default function (pi: ExtensionAPI) {
     });
     rowMapCache = undefined; // 内容变化，标记行映射失效
     clampOffset();
+    // 用户发送消息时强制回到底部跟随输出（pi 原生行为是：用户滚动后发送消息
+    // 不自动恢复跟随，这里补上“发送即回底”的预期；输出过程中用户主动滑动
+    // 仍会解除跟随，不影响浏览）
+    try {
+      (dotsTui as unknown as { scrollToBottom?(): void } | undefined)?.scrollToBottom?.();
+    } catch {
+      // 忽略
+    }
     dotsTui?.requestRender();
     // 新消息加入后内容变化，重新同步视口指示
     setTimeout(() => updateViewportIndicator(), 100);
