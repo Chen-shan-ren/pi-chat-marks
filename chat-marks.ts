@@ -107,9 +107,9 @@ export default function (pi: ExtensionAPI) {
     return { rows: t?.terminal?.rows ?? 30, columns: t?.terminal?.columns ?? 80 };
   }
 
-  /** 点列显示的最大行数（随终端高度自适应） */
+  /** 点列显示的最大行数：固定上限 10 个点；终端过矮时按可用高度缩小（不少于 4） */
   function dotsMaxRows(): number {
-    return Math.max(4, Math.min(40, termSize().rows - 8));
+    return Math.max(4, Math.min(10, termSize().rows - 8));
   }
 
   function dotsCount(): number {
