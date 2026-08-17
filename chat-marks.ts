@@ -107,9 +107,9 @@ export default function (pi: ExtensionAPI) {
     return { rows: t?.terminal?.rows ?? 30, columns: t?.terminal?.columns ?? 80 };
   }
 
-  /** 点列显示的最大行数：固定上限 10 个点；终端过矮时按可用高度缩小（不少于 4） */
+  /** 点列显示的最大行数：固定上限 18 个点；终端过矮时按可用高度缩小（不少于 4） */
   function dotsMaxRows(): number {
-    return Math.max(4, Math.min(10, termSize().rows - 8));
+    return Math.max(4, Math.min(18, termSize().rows - 8));
   }
 
   function dotsCount(): number {
@@ -146,13 +146,15 @@ export default function (pi: ExtensionAPI) {
       const i = scrollOffset + v;
       let dot: string;
       if (i === hoverIndex) {
+        // 悬停：最大点 + 反色背景 + 高亮色，与普通点对比强烈
         dot = theme.bold(theme.fg("accent", theme.bg("selectedBg", "⬤")));
       } else if (i === selectedIndex) {
         dot = theme.fg("accent", "◉");
       } else if (i === messages.length - 1) {
         dot = theme.fg("success", "●");
       } else {
-        dot = theme.fg("muted", "●");
+        // 普通：小点，避免视觉噪点
+        dot = theme.fg("muted", "•");
       }
       rows.push(width > 1 ? " " + dot : dot);
     }
