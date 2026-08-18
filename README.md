@@ -4,7 +4,7 @@
 
 **pi 对话标记点列扩展** — 让每一条对话在右侧一目了然
 
-鼠标悬停看内容 · 点击跳转 · 滚动跟随 · 双向联动 · **Regular & Fullscreen 双模式**
+鼠标悬停看内容 · 点击跳转 · 滚动跟随 · 双向联动
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![pi extension](https://img.shields.io/badge/pi-extension-4B32C3)](https://github.com/earendil-works/pi)
@@ -29,21 +29,35 @@
                                      ↑ 滚动条
 ```
 
+> **⚠️ 需要 fullscreen 模式才能获得完整鼠标交互。** regular 模式下仅提供点阵 + 键盘索引。
+> 设置方法：在 `/settings` 中将 TUI mode 改为 `fullscreen`，或启动时加 `--tui-mode fullscreen`。
+
 ---
 
 ## ✨ 功能
 
+### Fullscreen 模式（完整功能）
+
 | 功能 | 说明 |
 |------|------|
 | **右侧点列** | 每个点 = 一次发送，最新在底部；最多显示 **18 个点** |
-| **双高亮指示** | 绿色 `●` = 最后一次发送；黄色 `◉` = 当前视口位置，**随滚动实时跟随**（点列与内容双向联动） |
-| **鼠标悬停** | 悬停的点**变大高亮**（`⬤` + 反色），编辑器上方实时显示内容预览（时间 + 前 60 字），移开即消失 |
-| **点击跳转** | 左键点击点 → 对话区**直接滚动跳转**到那条消息（基于渲染标记精确定位，重复消息也不会错位） |
-| **滚轮翻点** | 对话超过 18 次时，在点列上滚轮即可**上下滑动翻看**所有点（不影响对话区滚动） |
-| **键盘索引** | `Ctrl+Alt+M` / `/marks`：可搜索的对话索引，`↑↓` 选择（点列同步高亮）、`Enter` 跳转 |
-| **发送即回底** | 发送消息后自动回到底部跟随输出（输出中主动滑动才解除跟随） |
-| **会话切换定位** | `/resume`/`/new` 切换会话后直接定位到最新消息 |
-| **双模式兼容** | 同时在 **regular** 和 **fullscreen** TUI 模式下完整可用 |
+| **双高亮指示** | 绿色 `●` = 最后一次发送；黄色 `◉` = 当前视口位置，**随滚动实时跟随** |
+| **鼠标悬停** | 悬停的点**变大高亮**（`⬤` + 反色），编辑器上方实时显示内容预览 |
+| **点击跳转** | 左键点击点 → 对话区**直接滚动跳转**到那条消息 |
+| **滚轮翻点** | 对话超过 18 次时，在点列上滚轮即可**上下滑动翻看**所有点 |
+| **键盘索引** | `Ctrl+Alt+M` / `/marks`：可搜索的对话索引，`↑↓` 选择、`Enter` 跳转 |
+| **发送即回底** | 发送消息后自动回到底部跟随输出 |
+
+### Regular 模式（精简功能）
+
+| 功能 | 说明 |
+|------|------|
+| **右侧点列** | 每个点 = 一次发送，最新在底部；最多 18 个点 |
+| **键盘索引** | `Ctrl+Alt+M` / `/marks`：可搜索的对话索引 |
+| 鼠标悬停 | ❌ 不可用 |
+| 点击跳转 | ❌ 不可用（见下文"架构限制"） |
+| 滚轮翻点 | ❌ 不可用 |
+| 视口联动 | ❌ 不可用 |
 
 ---
 
@@ -52,27 +66,23 @@
 ### 1. 安装
 
 ```bash
-# 复制到 pi 的全局扩展目录
 cp chat-marks.ts ~/.pi/agent/extensions/
-
 # 重启 pi（不是 /reload）
 ```
 
-**⚠️ 首次启动需要重启（不是 /reload）**：扩展会自动给 pi 的 TUI 组件打补丁（见下文"工作原理"），补丁在进程启动时加载，必须重启生效。
+**⚠️ 首次启动需要重启**：扩展会自动给 pi 的 TUI 组件打补丁，补丁在进程启动时加载，必须重启生效。
 
 **🔔 首次启动若看到 ⚠️ 提示**：说明补丁未生效（非标准安装/版本不兼容），按提示处理；键盘路径 `Ctrl+Alt+M` 始终可用。
 
 ### 2. 验证
 
-```
 - 右侧出现点列（有历史消息时）
-- 鼠标悬停点 → 变大 + 预览
-- Ctrl+Alt+M → 打开对话索引
-```
+- 鼠标悬停点 → 变大 + 预览（需 fullscreen 模式）
+- `Ctrl+Alt+M` → 打开对话索引
 
 ---
 
-## 🖱️ 使用指南
+## 🖱️ 使用指南（Fullscreen 模式）
 
 ```
 鼠标悬停点    → 点变大 + 内容预览（编辑器上方）
@@ -92,59 +102,81 @@ Ctrl+Alt+M   → 打开对话索引（键盘路径，可搜索）
 | `◉` 高亮色 | 键盘索引当前选中 |
 | `⬤` 大点+反色 | 鼠标悬停 |
 
-**渲染优先级**：悬停 > 视口位置 > 键盘选中 > 最新消息 > 普通。
-
 ---
 
-## 🔄 双模式兼容
+## 🏗️ 为什么 Regular 模式功能有限？
 
-扩展同时兼容 pi 的 **regular**（默认）和 **fullscreen**（实验性）两种 TUI 模式，所有功能在两种模式下行为一致：
+这是 pi TUI **架构层面的限制**，不是 bug，无法绕过。
 
-| 功能 | fullscreen | regular |
-|------|-----------|--------|
-| 点列渲染 | ✅ | ✅ |
-| 鼠标悬停预览 | ✅ 通过补丁钩子拦截 | ✅ 通过终端鼠标追踪 + inputListener |
-| 左键点击跳转 | ✅ 通过 ScrollView.scrollTo 精确跳转 | ⚠️ 目标在当前屏幕时可用；在 scrollback 中时尽力滚动，可能不精确（见 FAQ） |
-| 点列滚轮翻看 | ✅ | ✅ |
-| 视口联动（黄色 ◉） | ✅ 通过滚动钩子精确同步 | ✅ 通过 previousViewportTop 近似同步 |
-| 键盘索引 Ctrl+Alt+M | ✅ | ✅ |
-| 发送自动回底 | ✅ | ✅ |
+### Fullscreen 模式 (`TuiAltScreen`)
 
-两种模式的核心机制不同：
+```
+┌─────────────────────────────┐
+│  pi 管理的可滚动视口          │
+│  ┌─────────────────────┐    │
+│  │ 内容（ScrollView）   │ ◉  │  ← 点阵 overlay 是屏幕相对的
+│  │ 每次只渲染视口大小   │    │     始终在右侧固定位置
+│  └─────────────────────┘    │
+└─────────────────────────────┘
+   pi 控制 ScrollView.scrollTo()
+   SGR 鼠标事件由 pi 自己处理
+   → 点击跳转 ✓ 悬停 ✓ 滚轮 ✓
+```
 
-- **fullscreen 模式**：通过幂等补丁注入 `tui-alt-screen.js` 的鼠标钩子，在 pi 处理鼠标前拦截点列区域的点击/悬停/滚轮；通过 `scroll-view.js` 的滚动钩子实现视口联动
-- **regular 模式**：启用终端 SGR 鼠标追踪（协议 1003），通过 `addInputListener` 在 focused component 之前拦截鼠标事件；视口定位读取 TUI 内部 `previousViewportTop`/`previousLines`
+### Regular 模式 (`TuiMainScreen`)
+
+```
+终端主屏幕
+├── 内容行 1      ← 全部写入终端缓冲区
+├── 内容行 2
+├── ...
+├── 内容行 50     ← 超过终端高度时，终端自行管理 scrollback
+├── 内容行 51
+└── 内容行 52     ← 点阵在这里（内容相对），随内容滚动消失
+                    终端 scrollback 由终端管理，pi 无法控制
+                    → 点击跳转 ✗ 悬停 ✗ 滚轮 ✗
+```
+
+**关键差异：**
+
+| | fullscreen | regular |
+|---|-----------|---------|
+| 渲染范围 | 只渲染视口大小的内容 | 渲染全部内容写入终端 |
+| overlay 定位 | 屏幕相对（始终可见） | 内容相对（随内容滚动消失） |
+| 滚动控制 | pi 通过 `ScrollView.scrollTo()` 精确控制 | 终端自行管理 scrollback，pi 无法控制 |
+| SGR 鼠标 | pi 处理所有事件，不影响滚动 | 启用后**破坏**终端原生滚动 |
+
+简单来说：**fullscreen 模式是 pi 自己画了一个"画中画"窗口，可以精确控制滚动；regular 模式是直接往终端写文本，滚动由终端管理，pi 管不了。**
 
 ---
 
 ## 🔧 工作原理
 
-### 鼠标交互：两种模式，两种路径
+### 代码架构
 
-| | fullscreen | regular |
-|---|-----------|---------|
-| 鼠标钩子 | 补丁注入 `tui-alt-screen.js` 的 `handleViewportInput` | 终端启用 SGR 鼠标追踪，`addInputListener` 拦截 |
-| 滚动条守卫 | 补丁将 `hasOverlay()` 改为 `getTopmostVisibleOverlay()` | 不需要（overlay 不拦截） |
-| 选择守卫 | 同上 | 同上 |
-| 滚动钩子 | 补丁注入 `scroll-view.js` 的 `scrollTo`/`scrollBy` | 同上（共用 scroll-view.js） |
+```
+chat-marks.ts
+├── 共用代码（类型、工具函数、补丁系统）
+├── createFullscreenHandler() → 完整鼠标交互
+│   ├── 鼠标钩子（tui-alt-screen.js 补丁注入）
+│   ├── 滚动钩子（scroll-view.js 补丁注入）
+│   ├── 视口指示（ScrollView.scrollTop 精确同步）
+│   └── 点击跳转（ScrollView.scrollTo 精确跳转）
+├── createRegularHandler() → 点阵 + 键盘
+│   └── 无鼠标交互、无视口指示、无跳转
+└── 入口（模式检测 → 路由到对应 handler）
+```
 
-所有补丁**幂等**（检测到已打则跳过）；pi 升级覆盖文件后，扩展下次加载时**自动重新打补丁**。
+### 补丁系统
 
-### 精确定位：OSC133 标记 + 映射表
+| 补丁 | 文件 | 作用 |
+|------|------|------|
+| 鼠标钩子 | `tui-alt-screen.js` | 在 pi 处理鼠标前拦截点列区域的事件 |
+| 滚动条守卫 | `tui-alt-screen.js` | 非捕获 overlay 不再禁用滚动条点击/拖动 |
+| 选择守卫 | `tui-alt-screen.js` | 非捕获 overlay 不再禁用文本拖选复制 |
+| 滚动钩子 | `scroll-view.js`（×2） | 所有滚动通知扩展，驱动视口指示点 |
 
-- 渲染层每条用户消息带有 OSC133 标记行
-- 扩展构建"**标记行 ↔ 消息索引**"精确映射表（游标贪心匹配）
-- 跳转和视口指示都查表——重复文本消息、图片消息（无文本）都不会错位
-
-### 视口联动
-
-- **fullscreen**：`ScrollView.scrollTo/scrollBy` 补丁末尾通知扩展 → 读取 `getPrimaryScrollView().scrollTop + viewportHeight/2` → 更新黄色指示点
-- **regular**：滚动钩子通知扩展 → 读取 `previousViewportTop + terminalHeight/2` → 近似定位视口中线对应的消息
-
-### 点击跳转
-
-- **fullscreen**：通过 `ScrollView.scrollTo(matchRow)` 精确跳转
-- **regular**：通过 OSC133 标记定位目标渲染行，用 DECScroll 命令（`ESC [ n S`/`ESC [ n T`）滚动终端到对应位置
+补丁全部**幂等**（检测到已打则跳过）；pi 升级覆盖文件后，扩展下次加载时**自动重新打补丁**。
 
 ---
 
@@ -169,40 +201,37 @@ Ctrl+Alt+M   → 打开对话索引（键盘路径，可搜索）
 
 ## ❓ 常见问题（FAQ）
 
-**Q：为什么鼠标悬停没反应？**
-悬停需要终端支持**鼠标移动追踪**（协议 1003）：Windows Terminal / WezTerm / Ghostty 等支持；经典 cmd（conhost）不支持，悬停不可用——但**点击和滚轮可用**（conhost 支持点击/滚轮上报）。建议使用 Windows Terminal。
+**Q：为什么鼠标悬停/点击/滚轮不工作？**
+请确认使用 **fullscreen 模式**（在 `/settings` 中设置 TUI mode 为 `fullscreen`，或启动时加 `--tui-mode fullscreen`）。regular 模式下这些功能不可用（见上文"架构限制"）。
 
-**Q：为什么装了之后滚动条/拖选复制失效了？**
-旧版本的一个 bug（overlay 误禁用滚动条/选择），已通过"滚动条守卫/选择守卫"补丁修复。请确认使用的是最新版本并已重启。
+**Q：装了之后滚动条/拖选复制失效了？**
+旧版本的 bug（overlay 误禁用滚动条/选择），已通过"滚动条守卫/选择守卫"补丁修复。请确认使用的是最新版本并已重启。
 
-**Q：装了没效果（鼠标没反应）怎么办？**
-启动时会提示原因（⚠️ 通知）：找不到 pi 的 TUI 组件文件（非标准安装方式）、pi 版本不兼容（补丁点未找到）、或未重启。按提示处理；键盘路径 `Ctrl+Alt+M` 始终可用。
+**Q：装完没效果（鼠标没反应）怎么办？**
+1. 确认使用 fullscreen 模式
+2. 启动时会提示原因（⚠️ 通知）：补丁未生效 / pi 版本不兼容 / 未重启
+3. 按提示处理；键盘路径 `Ctrl+Alt+M` 始终可用
 
 **Q：为什么必须重启而不是 /reload？**
-鼠标钩子补丁修改的是 pi 的 TUI 组件文件，组件类在进程启动时就加载进内存了——`/reload` 只重载扩展，不会重新加载 pi 的 TUI。**重启一次即可**，之后更新扩展代码（不涉及新补丁）用 `/reload` 就行。
+补丁修改的是 pi 的 TUI 组件文件，组件类在进程启动时就加载进内存了——`/reload` 只重载扩展，不会重新加载 pi 的 TUI。**重启一次即可**。
 
 **Q：点列为什么最多 18 个点？**
 避免右侧视觉噪点。超过 18 次对话后，在点列上滚动滚轮即可翻看所有点。
 
 **Q：会不会影响打字/选择/滚动？**
-不会。点列是 `nonCapturing` overlay（不抢键盘焦点）；点列区域外的鼠标事件原样放行（拖选复制、滚动条拖动、滚轮滚动对话区都正常）。regular 模式下区域外事件全部放行，终端原生滚动不受任何干扰。
-
-**Q：regular 模式下鼠标会干扰其他操作吗？**
-不会。鼠标追踪仅在点列区域激活时消费事件；区域外的滚轮/拖拽/点击全部放行给终端（包括中键拖动查看 scrollback）。
-
-**Q：regular 模式下的点击跳转精确吗？**
-点击跳转在 regular 模式下有限制：DECScroll 只能操作当前屏幕缓冲区，无法到达 terminal 的 scrollback 历史。当目标消息已在 scrollback 中时，会尽量滚动到可见范围，但可能无法精确跳转——此时建议使用 `Ctrl+Alt+M` 键盘索引或直接使用 terminal 原生中键拖动来浏览。
+不会。点列是 `nonCapturing` overlay（不抢键盘焦点）；点列区域外的鼠标事件原样放行。
 
 **Q：扩展修改了 pi 的安装文件，安全吗？**
-补丁是**幂等、可恢复**的：只插入几行钩子调用（见上文表格），pi 升级覆盖文件后扩展会自动重新打补丁。不想要了：删除扩展文件即可（补丁代码保留但不再被调用，不影响功能）。
+补丁是**幂等、可恢复**的：只插入几行钩子调用，pi 升级覆盖文件后扩展会自动重新打补丁。不想要了：删除扩展文件即可。
 
 ---
 
 ## 🗂️ 项目结构
 
 ```
-chat-marks.ts   # 扩展主体（单文件，直接可用）
+chat-marks.ts   # 扩展主体（单文件，路由架构）
 README.md       # 本文档
+LICENSE          # MIT License
 ```
 
 ---
@@ -211,8 +240,8 @@ README.md       # 本文档
 
 | 版本 | 内容 |
 |------|------|
-| v6 | **修复 regular 模式 4 个 bug**：(a) 多出的 3 个点（termSize 未缓存） (b) 滑动中键全黑（事件消费全局） (c) 鼠标移入点列区域才恢复 (d) 点击不跳转（DECScroll 无法到 scrollback） |
-| v5 | **双模式兼容**：regular + fullscreen 双模式鼠标交互、视口指示、点击跳转全部可用 |
+| v6 | **路由架构重构**：`createFullscreenHandler` + `createRegularHandler` 模式路由；regular 模式精简为点阵+键盘；明确文档两种模式的架构限制 |
+| v5 | 双模式尝试（受限于架构，regular 模式鼠标交互无法可靠工作） |
 | v4 | 点击点改为滚动对话区跳转（不再弹窗展示） |
 | v3 | 悬停改为编辑器上方非模态 widget 展示内容 |
 | v2 | 点列 overlay 加 nonCapturing，修掉启动抢焦点 |
@@ -235,27 +264,3 @@ README.md       # 本文档
 ## 📄 License
 
 本项目采用 **MIT License**，全文本见 [LICENSE](LICENSE)。
-
-```
-MIT License
-
-Copyright (c) 2026 Chen-shan-ren
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
