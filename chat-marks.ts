@@ -5,18 +5,14 @@
  * 最新的在最底部。支持鼠标交互：
  *
  *   - 鼠标悬停点：该点变大高亮，同时在编辑器上方显示该次发送的内容预览
- *     （hover 需要终端支持鼠标移动追踪：Windows Terminal / WezTerm 等支持；
- *      经典 cmd/conhost 不支持移动追踪，hover 不可用，但点击/滚轮可用）
  *   - 鼠标左键点击点：对话区直接滚动跳转到你发送的那条消息所在位置
- *     （省去手动滚轮；定位依据是渲染行中的 OSC133 提示标记 + 消息文本匹配）
  *   - 鼠标滚轮在点列上滚动：对话多时上下翻看点（不滚动 transcript）
  *   - Ctrl+Alt+M 或 /marks：打开"对话索引"选择器（键盘路径，两种模式通用）
- *        ↑↓ 选择（点列同步高亮）· Enter 跳转到该消息 · Esc 关闭
  *
- * 说明：
- *   - fullscreen 模式：鼠标交互全部可用（点击/滚轮/hover 取决于终端）
- *   - regular 模式：终端未启用鼠标追踪，点列为纯视觉，用 Ctrl+Alt+M 键盘交互
- *   - 点击点列区域被本扩展消费，不会再触发 alt-screen 的拖选复制
+ * 模式兼容：
+ *   - fullscreen 模式：鼠标交互全部可用（点击/滚轮/hover/视口联动/跳转）
+ *   - regular 模式：鼠标交互全部可用（通过终端鼠标追踪 + inputListener）
+ *     点击跳转通过终端滚动命令实现；视口指示使用 previousViewportTop 近似
  *
  * 历史（修复记录）：
  *   - v1 用 modal overlay 弹窗展示详情，会抢占键盘焦点（未传 nonCapturing），
@@ -24,6 +20,8 @@
  *   - v2 给常驻点列 overlay 加 nonCapturing: true，修掉启动即抢焦点的问题。
  *   - v3 点击点改为编辑器上方非模态 widget 展示内容。
  *   - v4（本版）按用户需求：点击点直接滚动对话区跳转到该消息，不做内容展示。
+ *   - v5 双模式兼容：regular 模式下启用鼠标追踪 + inputListener，
+ *     视口指示/跳转/悬停全部可用。
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -58,15 +56,56 @@ function stripAnsi(s: string): string {
     .trim();
 }
 
+// ---- TUI 类型定义（两种模式共用 + 各自特有） ----
+
+interface TuiBaseLike {
+  terminal?: {
+    rows?: number;
+    columns?: number;
+    write?: (data: string) => void;
+  };
+  requestRender?: () => void;
+  addInputListener?: (fn: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
+  previousLines?: string[];
+  previousViewportTop?: number;
+}
+
+interface TuiFullscreenLike extends TuiBaseLike {
+  getPrimaryScrollView?: () => {
+    scrollTop: number;
+    viewportHeight: number;
+    scrollTo?: (row: number) => void;
+    scrollBy?: (lines: number) => void;
+    isFollowingEnd?: boolean;
+  };
+  currentLayout?: unknown;
+  scrollBy?: (lines: number) => void;
+  scrollToBottom?: () => void;
+  scrollToTop?: () => void;
+  flash?: (message: string, durationMs?: number) => void;
+}
+
+type TuiInstance = TuiBaseLike & Partial<TuiFullscreenLike>;
+
+// ---- 模式检测 ----
+
+function isFullscreenTui(tui: TuiInstance): boolean {
+  return !!(tui as TuiFullscreenLike).getPrimaryScrollView;
+}
+
 export default function (pi: ExtensionAPI) {
   let messages: UserMsg[] = [];
-  let selectedIndex = -1; // 键盘索引当前选中（点列高亮）
-  let hoverIndex = -1; // 鼠标悬停的点
-  let viewportIndex = -1; // 当前视口位置对应的消息（随 transcript 滚动联动）
-  let scrollOffset = 0; // 点列滚动偏移（消息多时）
+  let selectedIndex = -1;
+  let hoverIndex = -1;
+  let viewportIndex = -1;
+  let scrollOffset = 0;
   let sessionCtx: ExtensionContext | undefined;
-  let dotsTui: { requestRender(): void } | undefined;
-  let rowMapCache: { lines: string[]; map: Map<number, number> } | undefined; // 标记行→消息索引映射缓存
+  let dotsTui: TuiInstance | undefined;
+  let rowMapCache: { lines: string[]; map: Map<number, number> } | undefined;
+
+  // regular 模式鼠标追踪状态
+  let regularMouseEnabled = false;
+  let regularMouseCleanup: (() => void) | undefined;
 
   // ---- 工具函数 ----
 
@@ -103,13 +142,18 @@ export default function (pi: ExtensionAPI) {
 
   // ---- 点列几何与渲染 ----
 
-  /** 终端当前尺寸（来自钩子传入的 tui） */
+  /** 终端当前尺寸：优先 tui.terminal，回退 process.stdout */
   function termSize(): { rows: number; columns: number } {
-    const t = dotsTui as unknown as { terminal?: { rows?: number; columns?: number } } | undefined;
-    return { rows: t?.terminal?.rows ?? 30, columns: t?.terminal?.columns ?? 80 };
+    const t = dotsTui;
+    if (t?.terminal?.rows && t?.terminal?.columns) {
+      return { rows: t.terminal.rows, columns: t.terminal.columns };
+    }
+    return {
+      rows: process.stdout?.rows ?? 30,
+      columns: process.stdout?.columns ?? 80,
+    };
   }
 
-  /** 点列显示的最大行数：固定上限 18 个点；终端过矮时按可用高度缩小（不少于 4） */
   function dotsMaxRows(): number {
     return Math.max(4, Math.min(18, termSize().rows - 8));
   }
@@ -124,12 +168,10 @@ export default function (pi: ExtensionAPI) {
     if (scrollOffset < 0) scrollOffset = 0;
   }
 
-  /** 点列区域的顶部行（0-based） */
   function dotsTopRow(): number {
     return Math.max(0, Math.floor((termSize().rows - dotsCount()) / 2));
   }
 
-  /** 屏幕行号 y（1-based）对应的消息索引，不在点列内返回 -1 */
   function indexAtRow(y: number): number {
     const v = y - 1 - dotsTopRow();
     const i = scrollOffset + v;
@@ -148,18 +190,14 @@ export default function (pi: ExtensionAPI) {
       const i = scrollOffset + v;
       let dot: string;
       if (i === hoverIndex) {
-        // 悬停：最大点 + 反色背景 + 高亮色，与普通点对比强烈
         dot = theme.bold(theme.fg("accent", theme.bg("selectedBg", "⬤")));
       } else if (i === viewportIndex) {
-        // 视口位置：黄色中号点（随 transcript 滚动联动）
         dot = theme.fg("warning", "◉");
       } else if (i === selectedIndex) {
         dot = theme.fg("accent", "◉");
       } else if (i === messages.length - 1) {
-        // 最新（end）消息：绿色
         dot = theme.fg("success", "●");
       } else {
-        // 普通：小点，避免视觉噪点
         dot = theme.fg("muted", "•");
       }
       rows.push(width > 1 ? " " + dot : dot);
@@ -167,46 +205,70 @@ export default function (pi: ExtensionAPI) {
     return rows;
   }
 
-  /**
-   * 视口位置指示：读取 transcript 滚动位置，通过映射表找到视口中线对应的消息，
-   * 更新 viewportIndex（点列中的黄色 ◉），并让点列窗口跟随视口。所有滚动（鼠标
-   * 滚轮/键盘/滚动条/搜索）都会经过 ScrollView.scrollTo/scrollBy（补丁注入 __piScrollHook）。
-   */
+  // ---- 视口位置指示（双模式） ----
+
   function updateViewportIndicator(): void {
-    const t = dotsTui as unknown as {
-      currentLayout?: unknown;
-      getPrimaryScrollView?(): {
-        scrollTop: number;
-        viewportHeight: number;
-      };
-      requestRender(): void;
-    } | undefined;
-    if (!t?.getPrimaryScrollView || !t.currentLayout) return;
-    const sv = t.getPrimaryScrollView();
-    const box = findScrollViewBox(t.currentLayout, sv);
-    const lines = box?.scrollContentLines;
-    if (!lines || lines.length === 0) return;
-    const mid = Math.min(sv.scrollTop + Math.floor(sv.viewportHeight / 2), lines.length - 1);
-    // 从视口中线向上找最近的、能映射到消息的标记行（跳过图片消息等无文本标记）
-    const map = getRowMap(lines);
-    let markRow = -1;
-    for (let row = mid; row >= 0; row--) {
-      if (OSC133_PROMPT_START.test(lines[row] ?? "") && map.has(row)) {
-        markRow = row;
-        break;
+    const t = dotsTui;
+    if (!t) return;
+
+    // 全屏模式：通过 getPrimaryScrollView 精确读取
+    const fs = t as TuiFullscreenLike;
+    if (fs.getPrimaryScrollView && fs.currentLayout) {
+      try {
+        const sv = fs.getPrimaryScrollView();
+        if (!sv || sv.viewportHeight <= 0) return;
+        const box = findScrollViewBox(fs.currentLayout, sv);
+        const lines = box?.scrollContentLines;
+        if (!lines || lines.length === 0) return;
+        const mid = Math.min(sv.scrollTop + Math.floor(sv.viewportHeight / 2), lines.length - 1);
+        const map = getRowMap(lines);
+        let markRow = -1;
+        for (let row = mid; row >= 0; row--) {
+          if (OSC133_PROMPT_START.test(lines[row] ?? "") && map.has(row)) {
+            markRow = row;
+            break;
+          }
+        }
+        const next = markRow >= 0 ? (map.get(markRow) ?? -1) : -1;
+        if (next !== viewportIndex) {
+          viewportIndex = next;
+          t.requestRender?.();
+          syncWindowToViewport();
+        }
+      } catch {
+        // 静默
       }
+      return;
     }
-    const next = markRow >= 0 ? (map.get(markRow) ?? -1) : -1;
-    if (next !== viewportIndex) {
-      viewportIndex = next;
-      t.requestRender();
+
+    // regular 模式：使用 previousViewportTop + previousLines 近似
+    try {
+      const prevLines = t.previousLines ?? [];
+      if (prevLines.length === 0) return;
+      const viewportTop = t.previousViewportTop ?? 0;
+      const terminalHeight = t.terminal?.rows ?? 30;
+      const mid = Math.min(viewportTop + Math.floor(terminalHeight / 2), prevLines.length - 1);
+      const map = getRowMap(prevLines);
+      let markRow = -1;
+      for (let row = mid; row >= 0; row--) {
+        if (OSC133_PROMPT_START.test(prevLines[row] ?? "") && map.has(row)) {
+          markRow = row;
+          break;
+        }
+      }
+      const next = markRow >= 0 ? (map.get(markRow) ?? -1) : -1;
+      if (next !== viewportIndex) {
+        viewportIndex = next;
+        t.requestRender?.();
+        syncWindowToViewport();
+      }
+    } catch {
+      // 静默
     }
-    syncWindowToViewport();
   }
 
-  // ---- 跳转到指定用户消息 ----
+  // ---- 跳转到指定用户消息（双模式） ----
 
-  /** 与 pi-tui 内部 getScrollViewBox 等价：在布局树中找滚动视图对应的盒子 */
   function findScrollViewBox(frame: unknown, scrollView: unknown): { scrollContentLines?: string[] } | undefined {
     const visit = (box: { scrollView?: unknown; children?: unknown[] } | undefined): { scrollContentLines?: string[] } | undefined => {
       if (!box) return undefined;
@@ -221,24 +283,12 @@ export default function (pi: ExtensionAPI) {
     return visit(root as { scrollView?: unknown; children?: unknown[] });
   }
 
-  /**
-   * 判断一个渲染行是否为某条消息的首行：
-   * - 短消息（首行能容纳全文）：要求整行文本与消息文本完全一致
-   * - 长消息（首行只是开头）：要求首行（≥4 字符）是消息文本的前缀
-   */
   function matchesPromptRow(visible: string, targetText: string): boolean {
     if (!visible) return false;
     if (targetText.length <= visible.length) return visible === targetText;
     return visible.length >= 4 && targetText.startsWith(visible);
   }
 
-  /**
-   * 构建“渲染标记行 → messages 索引”的精确映射。
-   * 不能用标记行序号直接当消息索引：messages 只收集有文本的用户消息，
-   * 图片消息/空文本消息在渲染中有标记行但没有对应条目；文本也可能重复。
-   * 算法：游标贪心匹配——每个标记行取首段可见文本，从上次匹配位置之后找第一条
-   * 文本匹配的消息（文本匹配失败说明该标记行对应图片/空消息，跳过）。
-   */
   function buildRowMap(lines: string[]): Map<number, number> {
     const map = new Map<number, number>();
     let cursor = 0;
@@ -271,8 +321,6 @@ export default function (pi: ExtensionAPI) {
     return map;
   }
 
-  /** 点列窗口跟随视口：目标消息不在可见窗口时滑动窗口，让黄色指示点始终可见；
-   *  视口位于最近 count 条内时窗口回到最新（保持绿色最新点可见）。 */
   function syncWindowToViewport(): void {
     const count = dotsCount();
     if (count <= 0 || viewportIndex < 0) return;
@@ -280,50 +328,81 @@ export default function (pi: ExtensionAPI) {
     if (viewportIndex >= scrollOffset && viewportIndex < scrollOffset + count) return;
     let target: number;
     if (viewportIndex >= messages.length - count) {
-      target = maxOffset; // 视口在最近 count 条内 → 显示最新窗口
+      target = maxOffset;
     } else {
       target = Math.max(0, Math.min(maxOffset, viewportIndex - Math.floor(count / 2)));
     }
     if (target !== scrollOffset) {
       scrollOffset = target;
-      dotsTui?.requestRender();
+      dotsTui?.requestRender?.();
     }
   }
 
   /** 在渲染行中定位第 index 条用户消息并滚动过去。返回是否成功。 */
   function jumpToMessage(index: number): boolean {
-    const t = dotsTui as unknown as {
-      currentLayout?: unknown;
-      getPrimaryScrollView(): { scrollTo(row: number): void };
-      requestRender(): void;
-      flash?(message: string, durationMs?: number): void;
-    } | undefined;
-    if (!t || !t.currentLayout) return false;
-    const sv = t.getPrimaryScrollView();
-    const box = findScrollViewBox(t.currentLayout, sv);
-    const lines = box?.scrollContentLines;
-    if (!lines || lines.length === 0) return false;
+    const t = dotsTui;
+    if (!t) return false;
     const target = messages[index];
     if (!target) return false;
 
-    // 精确映射表定位（不依赖文本计数，杜绝重复消息错位）
-    const map = getRowMap(lines);
-    let matchRow = -1;
-    for (const [row, msgIndex] of map) {
-      if (msgIndex === index) {
-        matchRow = row;
-        break;
+    const fs = t as TuiFullscreenLike;
+    // 全屏模式：通过 ScrollView.scrollTo 精确跳转
+    if (fs.getPrimaryScrollView && fs.currentLayout) {
+      try {
+        const sv = fs.getPrimaryScrollView();
+        if (!sv || !sv.scrollTo) return false;
+        const box = findScrollViewBox(fs.currentLayout, sv);
+        const lines = box?.scrollContentLines;
+        if (!lines || lines.length === 0) return false;
+        const map = getRowMap(lines);
+        let matchRow = -1;
+        for (const [row, msgIndex] of map) {
+          if (msgIndex === index) { matchRow = row; break; }
+        }
+        if (matchRow < 0) return false;
+        sv.scrollTo(matchRow);
+        t.requestRender?.();
+        t.flash?.(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, 1500);
+        return true;
+      } catch {
+        return false;
       }
     }
-    if (matchRow < 0) return false;
 
-    sv.scrollTo(matchRow);
-    t.requestRender();
-    t.flash?.(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, 1500);
-    return true;
+    // regular 模式：使用 previousLines + 终端滚动命令
+    try {
+      const prevLines = t.previousLines ?? [];
+      if (prevLines.length === 0) return false;
+      const map = getRowMap(prevLines);
+      let matchRow = -1;
+      for (const [row, msgIndex] of map) {
+        if (msgIndex === index) { matchRow = row; break; }
+      }
+      if (matchRow < 0) return false;
+
+      const viewportTop = t.previousViewportTop ?? 0;
+      const terminalHeight = t.terminal?.rows ?? 30;
+      const targetScreenRow = matchRow - viewportTop;
+      const screenCenter = Math.floor(terminalHeight / 2);
+
+      if (targetScreenRow < 0 || targetScreenRow >= terminalHeight) {
+        const scrollDelta = targetScreenRow - screenCenter;
+        // DECScroll: \x1b[<n>S = scroll up (older content), \x1b[<n>T = scroll down (newer)
+        const cmd = scrollDelta > 0
+          ? `\x1b[${Math.abs(scrollDelta)}T`
+          : `\x1b[${Math.abs(scrollDelta)}S`;
+        t.terminal?.write?.(cmd);
+      }
+
+      t.requestRender?.();
+      sessionCtx?.ui.notify(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, "info");
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  // ---- 鼠标钩子补丁 ----
+  // ---- 鼠标钩子补丁（仅 fullscreen 需要，因为 regular 用 inputListener） ----
 
   const PATCH_MARK = "__piMouseHook";
   const PATCH_ANCHOR =
@@ -339,9 +418,6 @@ export default function (pi: ExtensionAPI) {
     '        }\n' +
     '        const wheelEvent = this.parseWheelEvent(data);';
 
-  // 常驻点列是 nonCapturing overlay，但 pi 的滚动条/选择逻辑用 hasOverlay() 判定，
-  // 导致只要有任何 overlay 存在（含非捕获的常驻点列），滚动条点击/拖拽和文本选择全部失效。
-  // 补丁：改用 getTopmostVisibleOverlay()（只统计捕获型 overlay），非捕获 overlay 不再禁用滚动条。
   const PATCH2_MARK = "__piScrollbarGuardPatch";
   const PATCH2_ANCHOR =
     "    getScrollbarTargetAt(x, y) {\n" +
@@ -362,8 +438,6 @@ export default function (pi: ExtensionAPI) {
     "        const scrollView = !this.getTopmostVisibleOverlay() && this.currentLayout\n" +
     "            ? getScrollViewsAt(this.currentLayout, event.x, event.y)[0]\n" +
     "            : undefined;";
-  // 滚动钩子补丁（scroll-view.js）：所有滚动（鼠标滚轮/键盘/滚动条/搜索/自动跟随）
-  // 都汇聚到 ScrollView.scrollTo/scrollBy，在其末尾通知扩展（视口位置指示联动）。
   const PATCH4_MARK = "__piScrollHook";
   const PATCH4_ANCHOR =
     "        if (moved)\n            this.markScrollbarActivity();\n        this.requestRenderCallback?.();\n    }\n    scrollBy(lines) {";
@@ -380,17 +454,13 @@ export default function (pi: ExtensionAPI) {
     try {
       const req = (globalThis as { require?: NodeRequire }).require ?? require;
       const pkgEntry = req.resolve("@earendil-works/pi-coding-agent");
-      // pi-tui 嵌套在 pi-coding-agent 包的 node_modules 下
       candidates.push(
         join(dirname(dirname(pkgEntry)), "node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"),
       );
-    } catch {
-      // 忽略，继续尝试其他候选
-    }
+    } catch { /* */ }
     const execDir = dirname(process.execPath);
     candidates.push(join(execDir, "node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"));
     candidates.push(join(process.cwd(), "node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"));
-    // 全局 npm 安装位置（npm root -g 的常见路径）
     try {
       const { execSync } = require("node:child_process") as typeof import("node:child_process");
       const root = execSync("npm root -g", { encoding: "utf8", windowsHide: true, timeout: 5000 }).trim();
@@ -398,16 +468,13 @@ export default function (pi: ExtensionAPI) {
         candidates.push(join(root, "@earendil-works/pi-tui/dist/tui-alt-screen.js"));
         candidates.push(join(root, "@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"));
       }
-    } catch {
-      // 无 npm 或执行失败，忽略
-    }
+    } catch { /* */ }
     for (const c of candidates) {
       if (existsSync(c)) return c;
     }
     return undefined;
   }
 
-  /** scroll-view.js 与 tui-alt-screen.js 同目录（../components/scroll-view.js） */
   function findScrollViewPath(): string | undefined {
     const alt = findTuiAltScreenPath();
     if (!alt) return undefined;
@@ -415,16 +482,13 @@ export default function (pi: ExtensionAPI) {
     return existsSync(p) ? p : undefined;
   }
 
-  /** 对 tui-alt-screen.js 应用幂等补丁：patch 未生效（含标记）时替换 anchor。 */
-  // 注意：TUI 模式下 console.* 会直接污染终端屏幕（扩展重载时重新打印），
-  // 因此补丁日志全部静默，仅在显式调试（CHAT_MARKS_DEBUG=1）时输出。
   const debug = process.env.CHAT_MARKS_DEBUG === "1";
   const log = debug ? (msg: string) => console.log(msg) : () => {};
   const warn = debug ? (msg: string) => console.warn(msg) : () => {};
 
   function applyIdempotentPatch(file: string, mark: string, anchor: string, insert: string, label: string): void {
     const src = readFileSync(file, "utf8");
-    if (src.includes(mark)) return; // 已打过补丁
+    if (src.includes(mark)) return;
     if (!src.includes(anchor)) {
       if (!patchProblem) {
         patchProblem = `pi 版本与扩展不兼容（补丁点 ${label} 未找到）。请更新 pi-chat-marks 扩展，或提 Issue 适配新版本；键盘路径 Ctrl+Alt+M 仍可用`;
@@ -436,8 +500,7 @@ export default function (pi: ExtensionAPI) {
     log(`[chat-marks] 已打补丁（${label}）:`, file);
   }
 
-  /** 幂等补丁：插入鼠标钩子调用点、滚动钩子调用点，并放开非捕获 overlay 对滚动条/选择的禁用。 */
-  let patchProblem: string | undefined; // 补丁问题描述（用于启动时提示用户）
+  let patchProblem: string | undefined;
 
   function ensureAltScreenPatches(): void {
     try {
@@ -466,87 +529,85 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ---- 交互 ----
+  // ---- regular 模式鼠标追踪 ----
 
-  /**
-   * 让聊天区滚动条常驻可见可点。
-   * pi 的滚动条默认是瞬态的（滚动动作后约 1 秒隐藏，隐藏期间点击无效，且悬停无法重新唤起），
-   * 这在有常驻点列时很容易让用户以为滚动条被点列挡住。这里在首次鼠标事件时把
-   * 聊天主滚动条的隐藏延迟调大并强制可见（只影响聊天区滚动条，不影响其他 UI）。
-   */
-  let scrollbarPersisted = false;
-  function ensureTranscriptScrollbarPersistent(): void {
-    if (scrollbarPersisted) return;
-    const t = dotsTui as unknown as {
-      getPrimaryScrollView?(): {
-        scrollbarHideDelayMs?: number;
-        transientScrollbarVisible?: boolean;
-      };
-    } | undefined;
-    const sv = t?.getPrimaryScrollView?.();
-    if (!sv) return;
-    scrollbarPersisted = true;
-    try {
-      sv.scrollbarHideDelayMs = 600_000; // 10 分钟后再隐藏（实际相当于常驻）
-      sv.transientScrollbarVisible = true; // 立即显示
-    } catch {
-      /* 忽略 */
+  /** 在 regular 模式下启用终端 SGR 鼠标追踪 + inputListener */
+  function enableRegularMouse(tui: TuiInstance): void {
+    if (regularMouseEnabled) return;
+    regularMouseEnabled = true;
+    // 启用 SGR 鼠标追踪（button + drag + all-motion + SGR format）
+    tui.terminal?.write?.("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
+    // 注册 inputListener（在 focused component 之前接收输入）
+    if (tui.addInputListener) {
+      regularMouseCleanup = tui.addInputListener((data: string) => {
+        if (typeof data !== "string") return undefined;
+        if (!data.startsWith("\x1b[<")) return undefined;
+        return handleRegularMouse(data);
+      });
+      log("[chat-marks] regular 模式：已启用鼠标追踪 + inputListener");
     }
   }
 
-  /** 鼠标事件是否落在点列区域 */
-  function inDotsRegion(x: number, y: number): boolean {
-    const { columns, rows } = termSize();
-    if (x < columns - 2 || x > columns - 1) return false; // 点列占右数第 2、3 列（scrollbar 在最右列）
-    const count = dotsCount();
-    if (count === 0) return false;
-    const top = dotsTopRow();
-    return y >= top + 1 && y <= top + count && y <= rows;
+  /** 在 regular 模式下禁用终端鼠标追踪 */
+  function disableRegularMouse(tui: TuiInstance): void {
+    if (!regularMouseEnabled) return;
+    regularMouseEnabled = false;
+    regularMouseCleanup?.();
+    regularMouseCleanup = undefined;
+    tui.terminal?.write?.("\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
   }
 
-  function handleMouse(data: string, tui: unknown): { consume?: boolean } | undefined {
-    dotsTui = tui as { requestRender(): void } | undefined;
-    ensureTranscriptScrollbarPersistent();
+  /** regular 模式鼠标事件处理 */
+  function handleRegularMouse(data: string): { consume?: boolean } | undefined {
+    dotsTui = dotsTui; // ensure reference
     const mouse = parseSgrMouse(data);
     if (!mouse) return undefined;
 
-    // SGR 按钮编码：<32=点击/释放，32-63=移动，>=64=滚轮；低位 2 位=按钮号(0左1中2右3释放)
     const btn = mouse.button & 3;
     const isMove = mouse.button >= 32 && mouse.button < 64;
     const isWheel = mouse.button >= 64;
 
     if (!inDotsRegion(mouse.x, mouse.y)) {
-      // 点列区域外：放行（保留 alt-screen 的拖选复制/滚动条/滚轮滚动）
+      // 点列区域外
       if ((isMove || (btn === 0 && mouse.press)) && hoverIndex !== -1) {
         hoverIndex = -1;
         updateHoverPreview();
-        dotsTui?.requestRender();
+        dotsTui?.requestRender?.();
       }
-      return undefined;
+      // 区域外的滚轮：转为终端滚动（DECScroll）
+      if (isWheel) {
+        const direction = btn === 0 ? -1 : 1;
+        const lines = Math.abs(direction) * 3;
+        const cmd = direction > 0
+          ? `\x1b[${lines}T`  // 向下滚（看更新的内容）
+          : `\x1b[${lines}S`; // 向上滚（看更早的内容）
+        dotsTui?.terminal?.write?.(cmd);
+        return { consume: true };
+      }
+      // 区域外的点击/移动：消费掉，避免干扰 pi 编辑器
+      return { consume: true };
     }
 
+    // ---- 点列区域内 ----
     const target = indexAtRow(mouse.y);
 
-    // 移动事件：悬停
     if (isMove) {
       if (target !== hoverIndex) {
         hoverIndex = target;
         updateHoverPreview();
-        dotsTui?.requestRender();
+        dotsTui?.requestRender?.();
       }
       return { consume: true };
     }
 
-    // 滚轮：滚动点列（64=上 65=下，忽略修饰键）
     if (isWheel) {
       if (btn === 0) scrollOffset--;
       else scrollOffset++;
       clampOffset();
-      dotsTui?.requestRender();
+      dotsTui?.requestRender?.();
       return { consume: true };
     }
 
-    // 左键点击：跳转到该消息在对话区的位置
     if (btn === 0 && mouse.press) {
       if (target >= 0) {
         hoverIndex = -1;
@@ -555,12 +616,94 @@ export default function (pi: ExtensionAPI) {
         if (!ok) {
           sessionCtx?.ui.notify("未能在对话区定位到该消息（可能已被折叠或不在当前会话）", "warning");
         }
-        dotsTui?.requestRender();
+        dotsTui?.requestRender?.();
       }
       return { consume: true };
     }
 
-    // 中键/右键在点列区域：一律消费，避免触发粘贴/选择；释放事件也消费（防复制）
+    if (btn === 1 || btn === 2 || !mouse.press) {
+      return { consume: true };
+    }
+
+    return { consume: true };
+  }
+
+  // ---- fullscreen 模式鼠标钩子（通过 tui-alt-screen.js 补丁注入） ----
+
+  function inDotsRegion(x: number, y: number): boolean {
+    const { columns, rows } = termSize();
+    if (x < columns - 2 || x > columns - 1) return false;
+    const count = dotsCount();
+    if (count === 0) return false;
+    const top = dotsTopRow();
+    return y >= top + 1 && y <= top + count && y <= rows;
+  }
+
+  /** 让聊天区滚动条常驻可见可点（仅 fullscreen 模式） */
+  let scrollbarPersisted = false;
+  function ensureTranscriptScrollbarPersistent(): void {
+    if (scrollbarPersisted) return;
+    const fs = dotsTui as TuiFullscreenLike;
+    const sv = fs?.getPrimaryScrollView?.();
+    if (!sv) return;
+    scrollbarPersisted = true;
+    try {
+      (sv as { scrollbarHideDelayMs?: number; transientScrollbarVisible?: boolean }).scrollbarHideDelayMs = 600_000;
+      (sv as { scrollbarHideDelayMs?: number; transientScrollbarVisible?: boolean }).transientScrollbarVisible = true;
+    } catch { /* */ }
+  }
+
+  function handleMouse(data: string, tui: unknown): { consume?: boolean } | undefined {
+    dotsTui = tui as TuiInstance;
+    ensureTranscriptScrollbarPersistent();
+    const mouse = parseSgrMouse(data);
+    if (!mouse) return undefined;
+
+    const btn = mouse.button & 3;
+    const isMove = mouse.button >= 32 && mouse.button < 64;
+    const isWheel = mouse.button >= 64;
+
+    if (!inDotsRegion(mouse.x, mouse.y)) {
+      if ((isMove || (btn === 0 && mouse.press)) && hoverIndex !== -1) {
+        hoverIndex = -1;
+        updateHoverPreview();
+        dotsTui?.requestRender?.();
+      }
+      return undefined;
+    }
+
+    const target = indexAtRow(mouse.y);
+
+    if (isMove) {
+      if (target !== hoverIndex) {
+        hoverIndex = target;
+        updateHoverPreview();
+        dotsTui?.requestRender?.();
+      }
+      return { consume: true };
+    }
+
+    if (isWheel) {
+      if (btn === 0) scrollOffset--;
+      else scrollOffset++;
+      clampOffset();
+      dotsTui?.requestRender?.();
+      return { consume: true };
+    }
+
+    if (btn === 0 && mouse.press) {
+      if (target >= 0) {
+        hoverIndex = -1;
+        updateHoverPreview();
+        const ok = jumpToMessage(target);
+        if (!ok) {
+          sessionCtx?.ui.notify("未能在对话区定位到该消息（可能已被折叠或不在当前会话）", "warning");
+        }
+        dotsTui?.requestRender?.();
+      }
+      return { consume: true };
+    }
+
     if (btn === 1 || btn === 2 || !mouse.press) {
       return { consume: true };
     }
@@ -604,7 +747,6 @@ export default function (pi: ExtensionAPI) {
       );
       const list = new SelectList(items, Math.min(items.length, 12), getSelectListTheme());
       list.onSelect = (item) => {
-        // 跳转到该消息，然后立即关闭选择器，焦点回到输入框
         selectedIndex = Number(item.value);
         const ok = jumpToMessage(selectedIndex);
         if (!ok) {
@@ -612,12 +754,10 @@ export default function (pi: ExtensionAPI) {
         }
         done(undefined);
       };
-      list.onCancel = () => {
-        done(undefined);
-      };
+      list.onCancel = () => done(undefined);
       list.onSelectionChange = (item) => {
         selectedIndex = Number(item.value);
-        tui.requestRender();
+        tui.requestRender?.();
       };
       container.addChild(list);
       return {
@@ -625,7 +765,7 @@ export default function (pi: ExtensionAPI) {
         invalidate: () => container.invalidate(),
         handleInput: (data: string) => {
           list.handleInput?.(data);
-          tui.requestRender();
+          tui.requestRender?.();
         },
       };
     }, {
@@ -637,7 +777,7 @@ export default function (pi: ExtensionAPI) {
       },
     });
     selectedIndex = -1;
-    dotsTui?.requestRender();
+    dotsTui?.requestRender?.();
   }
 
   // ---- 事件 ----
@@ -650,18 +790,17 @@ export default function (pi: ExtensionAPI) {
     selectedIndex = -1;
     hoverIndex = -1;
     scrollOffset = 0;
+    viewportIndex = -1;
     sessionCtx = ctx;
     dotsTui = undefined;
     if (!ctx.hasUI || ctx.mode !== "tui") return;
 
-    // 安装鼠标钩子（alt-screen 的 handleViewportInput 会先调用它）
-    (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = (data: string, tui: unknown) =>
-      handleMouse(data, tui as never);
-    // 安装滚动钩子（ScrollView.scrollTo/scrollBy 末尾调用，视口指示联动）
+    // 安装滚动钩子（两种模式的 ScrollView 共用 scroll-view.js）
     (globalThis as unknown as Record<string, unknown>)["__piScrollHook"] = () => {
       updateViewportIndicator();
     };
 
+    // 读取历史消息
     try {
       for (const entry of ctx.sessionManager.getEntries()) {
         if (entry.type === "message" && entry.message?.role === "user") {
@@ -675,14 +814,24 @@ export default function (pi: ExtensionAPI) {
           }
         }
       }
-    } catch {
-      // 历史读取失败不影响使用
-    }
+    } catch { /* */ }
 
     // 常驻点列 overlay（贴右边缘，滚动条左侧）
-    // 必须 nonCapturing：常驻 overlay 一旦捕获焦点，输入框将永远无法打字
     void ctx.ui.custom((tui, theme) => {
-      dotsTui = tui;
+      dotsTui = tui as TuiInstance;
+
+      // 模式检测 + 鼠标初始化
+      const fullscreen = isFullscreenTui(tui as TuiInstance);
+      if (fullscreen) {
+        // fullscreen：注册鼠标钩子到 globalThis（tui-alt-screen.js 补丁调用）
+        (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = (data: string, t: unknown) =>
+          handleMouse(data, t as never);
+        log("[chat-marks] fullscreen 模式：已注册 __piMouseHook");
+      } else {
+        // regular：启用终端鼠标追踪 + inputListener
+        enableRegularMouse(tui as TuiInstance);
+      }
+
       return {
         render: (w: number) => renderDots(w, theme),
         invalidate: () => {},
@@ -699,15 +848,14 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    // 等 transcript 布局渲染完成后：强制滚到底部并同步视口指示。
-    // 修复：点击跳转（或手动滚动）后 followingEnd 被破坏，/resume 切换会话时
-    // pi 复用 ScrollView 且不重置滚动位置，导致新会话停在中间而非底部。
+    // 等 transcript 布局渲染完成后：强制滚到底部并同步视口指示
     setTimeout(() => {
       try {
-        (dotsTui as unknown as { scrollToBottom?(): void } | undefined)?.scrollToBottom?.();
-      } catch {
-        // 忽略
-      }
+        const fs = dotsTui as TuiFullscreenLike;
+        if (fs?.scrollToBottom) {
+          fs.scrollToBottom();
+        }
+      } catch { /* */ }
       updateViewportIndicator();
     }, 200);
   });
@@ -721,28 +869,27 @@ export default function (pi: ExtensionAPI) {
       timestamp: event.message.timestamp ?? Date.now(),
       text,
     });
-    rowMapCache = undefined; // 内容变化，标记行映射失效
+    rowMapCache = undefined;
     clampOffset();
-    // 用户发送消息时强制回到底部跟随输出（pi 原生行为是：用户滚动后发送消息
-    // 不自动恢复跟随，这里补上“发送即回底”的预期；输出过程中用户主动滑动
-    // 仍会解除跟随，不影响浏览）
     try {
-      (dotsTui as unknown as { scrollToBottom?(): void } | undefined)?.scrollToBottom?.();
-    } catch {
-      // 忽略
-    }
-    dotsTui?.requestRender();
-    // 新消息加入后内容变化，重新同步视口指示
+      const fs = dotsTui as TuiFullscreenLike;
+      if (fs?.scrollToBottom) {
+        fs.scrollToBottom();
+      }
+    } catch { /* */ }
+    dotsTui?.requestRender?.();
     setTimeout(() => updateViewportIndicator(), 100);
   });
 
   pi.on("session_shutdown", () => {
     (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = undefined;
     (globalThis as unknown as Record<string, unknown>)["__piScrollHook"] = undefined;
+    // 清理 regular 模式鼠标追踪
+    if (dotsTui) {
+      disableRegularMouse(dotsTui);
+    }
     sessionCtx = undefined;
   });
-
-  // ---- 入口 ----
 
   pi.registerShortcut("ctrl+alt+m", {
     description: "打开对话索引（跳转到指定消息）",

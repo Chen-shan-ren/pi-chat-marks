@@ -4,7 +4,7 @@
 
 **pi 对话标记点列扩展** — 让每一条对话在右侧一目了然
 
-鼠标悬停看内容 · 点击跳转 · 滚动跟随 · 双向联动
+鼠标悬停看内容 · 点击跳转 · 滚动跟随 · 双向联动 · **Regular & Fullscreen 双模式**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![pi extension](https://img.shields.io/badge/pi-extension-4B32C3)](https://github.com/earendil-works/pi)
@@ -43,6 +43,7 @@
 | **键盘索引** | `Ctrl+Alt+M` / `/marks`：可搜索的对话索引，`↑↓` 选择（点列同步高亮）、`Enter` 跳转 |
 | **发送即回底** | 发送消息后自动回到底部跟随输出（输出中主动滑动才解除跟随） |
 | **会话切换定位** | `/resume`/`/new` 切换会话后直接定位到最新消息 |
+| **双模式兼容** | 同时在 **regular** 和 **fullscreen** TUI 模式下完整可用 |
 
 ---
 
@@ -54,7 +55,7 @@
 # 复制到 pi 的全局扩展目录
 cp chat-marks.ts ~/.pi/agent/extensions/
 
-# 重启 pi
+# 重启 pi（不是 /reload）
 ```
 
 **⚠️ 首次启动需要重启（不是 /reload）**：扩展会自动给 pi 的 TUI 组件打补丁（见下文"工作原理"），补丁在进程启动时加载，必须重启生效。
@@ -64,7 +65,6 @@ cp chat-marks.ts ~/.pi/agent/extensions/
 ### 2. 验证
 
 ```
-/mm-status 不适用本扩展 —— 直接看：
 - 右侧出现点列（有历史消息时）
 - 鼠标悬停点 → 变大 + 预览
 - Ctrl+Alt+M → 打开对话索引
@@ -96,20 +96,39 @@ Ctrl+Alt+M   → 打开对话索引（键盘路径，可搜索）
 
 ---
 
+## 🔄 双模式兼容
+
+扩展同时兼容 pi 的 **regular**（默认）和 **fullscreen**（实验性）两种 TUI 模式，所有功能在两种模式下行为一致：
+
+| 功能 | fullscreen | regular |
+|------|-----------|--------|
+| 点列渲染 | ✅ | ✅ |
+| 鼠标悬停预览 | ✅ 通过补丁钩子拦截 | ✅ 通过终端鼠标追踪 + inputListener |
+| 左键点击跳转 | ✅ 通过 ScrollView.scrollTo 精确跳转 | ✅ 通过 OSC133 标记定位 + DECScroll 滚动 |
+| 点列滚轮翻看 | ✅ | ✅ |
+| 视口联动（黄色 ◉） | ✅ 通过滚动钩子精确同步 | ✅ 通过 previousViewportTop 近似同步 |
+| 键盘索引 Ctrl+Alt+M | ✅ | ✅ |
+| 发送自动回底 | ✅ | ✅ |
+
+两种模式的核心机制不同：
+
+- **fullscreen 模式**：通过幂等补丁注入 `tui-alt-screen.js` 的鼠标钩子，在 pi 处理鼠标前拦截点列区域的点击/悬停/滚轮；通过 `scroll-view.js` 的滚动钩子实现视口联动
+- **regular 模式**：启用终端 SGR 鼠标追踪（协议 1003），通过 `addInputListener` 在 focused component 之前拦截鼠标事件；视口定位读取 TUI 内部 `previousViewportTop`/`previousLines`
+
+---
+
 ## 🔧 工作原理
 
-### 鼠标交互：钩子补丁
+### 鼠标交互：两种模式，两种路径
 
-pi 的 TUI 会先于扩展消费鼠标事件（点击会被当成拖选复制）。本扩展在加载时**自动幂等**地对 pi 安装目录打补丁：
+| | fullscreen | regular |
+|---|-----------|---------|
+| 鼠标钩子 | 补丁注入 `tui-alt-screen.js` 的 `handleViewportInput` | 终端启用 SGR 鼠标追踪，`addInputListener` 拦截 |
+| 滚动条守卫 | 补丁将 `hasOverlay()` 改为 `getTopmostVisibleOverlay()` | 不需要（overlay 不拦截） |
+| 选择守卫 | 同上 | 同上 |
+| 滚动钩子 | 补丁注入 `scroll-view.js` 的 `scrollTo`/`scrollBy` | 同上（共用 scroll-view.js） |
 
-| 补丁 | 文件 | 作用 |
-|------|------|------|
-| 鼠标钩子 | `tui-alt-screen.js` | 在 pi 处理鼠标前拦截点列区域的点击/悬停/滚轮 |
-| 滚动条守卫 | `tui-alt-screen.js` | 非捕获 overlay 不再禁用滚动条点击/拖动 |
-| 选择守卫 | `tui-alt-screen.js` | 非捕获 overlay 不再禁用文本拖选复制 |
-| 滚动钩子 | `scroll-view.js`（×2） | 所有滚动（滚轮/键盘/滚动条/搜索）通知扩展，驱动视口指示点 |
-
-补丁全部**幂等**（检测到已打则跳过）；pi 升级覆盖文件后，扩展下次加载时**自动重新打补丁**。
+所有补丁**幂等**（检测到已打则跳过）；pi 升级覆盖文件后，扩展下次加载时**自动重新打补丁**。
 
 ### 精确定位：OSC133 标记 + 映射表
 
@@ -117,9 +136,15 @@ pi 的 TUI 会先于扩展消费鼠标事件（点击会被当成拖选复制）
 - 扩展构建"**标记行 ↔ 消息索引**"精确映射表（游标贪心匹配）
 - 跳转和视口指示都查表——重复文本消息、图片消息（无文本）都不会错位
 
-### 视口联动：滚动钩子
+### 视口联动
 
-`ScrollView.scrollTo/scrollBy` 是所有滚动的汇聚点，补丁在其末尾通知扩展 → 扩展读取视口中线对应的消息 → 更新黄色指示点，并让点列窗口跟随视口（目标点始终可见）。
+- **fullscreen**：`ScrollView.scrollTo/scrollBy` 补丁末尾通知扩展 → 读取 `getPrimaryScrollView().scrollTop + viewportHeight/2` → 更新黄色指示点
+- **regular**：滚动钩子通知扩展 → 读取 `previousViewportTop + terminalHeight/2` → 近似定位视口中线对应的消息
+
+### 点击跳转
+
+- **fullscreen**：通过 `ScrollView.scrollTo(matchRow)` 精确跳转
+- **regular**：通过 OSC133 标记定位目标渲染行，用 DECScroll 命令（`ESC [ n S`/`ESC [ n T`）滚动终端到对应位置
 
 ---
 
@@ -147,13 +172,10 @@ pi 的 TUI 会先于扩展消费鼠标事件（点击会被当成拖选复制）
 **Q：为什么鼠标悬停没反应？**
 悬停需要终端支持**鼠标移动追踪**（协议 1003）：Windows Terminal / WezTerm / Ghostty 等支持；经典 cmd（conhost）不支持，悬停不可用——但**点击和滚轮可用**（conhost 支持点击/滚轮上报）。建议使用 Windows Terminal。
 
-**Q：点击点为什么之前会出现 "Copied!"？**
-那是 pi 把点击当成了"拖选复制"（闪出 Copied 提示）。本扩展的鼠标钩子补丁会拦截点列区域的点击，这个问题已消除。
-
 **Q：为什么装了之后滚动条/拖选复制失效了？**
-那是旧版本的 bug（overlay 误禁用滚动条/选择），已通过"滚动条守卫/选择守卫"补丁修复。请确认使用的是最新版本并已重启。
+旧版本的一个 bug（overlay 误禁用滚动条/选择），已通过"滚动条守卫/选择守卫"补丁修复。请确认使用的是最新版本并已重启。
 
-**Q：装完没效果（鼠标没反应）怎么办？**
+**Q：装了没效果（鼠标没反应）怎么办？**
 启动时会提示原因（⚠️ 通知）：找不到 pi 的 TUI 组件文件（非标准安装方式）、pi 版本不兼容（补丁点未找到）、或未重启。按提示处理；键盘路径 `Ctrl+Alt+M` 始终可用。
 
 **Q：为什么必须重启而不是 /reload？**
@@ -165,6 +187,12 @@ pi 的 TUI 会先于扩展消费鼠标事件（点击会被当成拖选复制）
 **Q：会不会影响打字/选择/滚动？**
 不会。点列是 `nonCapturing` overlay（不抢键盘焦点）；点列区域外的鼠标事件原样放行（拖选复制、滚动条拖动、滚轮滚动对话区都正常）。
 
+**Q：regular 模式下鼠标会干扰其他操作吗？**
+不会。鼠标追踪仅在点列区域激活时消费事件；区域外的滚轮转为终端滚动（DECScroll），点击被消费但不影响编辑器正常交互。切换会话或关闭时自动禁用追踪。
+
+**Q：regular 模式下的视口指示和跳转不够精确吗？**
+approximate 级别。regular 模式下 pi 不使用 ScrollView 而是直接写入终端主屏幕，无法通过 API 精确控制滚动位置；视口指示使用 TUI 内部 `previousViewportTop` 近似定位，点击跳转使用 DECScroll 近似滚动。绝大多数场景下体验与 fullscreen 一致。
+
 **Q：扩展修改了 pi 的安装文件，安全吗？**
 补丁是**幂等、可恢复**的：只插入几行钩子调用（见上文表格），pi 升级覆盖文件后扩展会自动重新打补丁。不想要了：删除扩展文件即可（补丁代码保留但不再被调用，不影响功能）。
 
@@ -174,6 +202,7 @@ pi 的 TUI 会先于扩展消费鼠标事件（点击会被当成拖选复制）
 
 ```
 chat-marks.ts   # 扩展主体（单文件，直接可用）
+README.md       # 本文档
 ```
 
 ---
@@ -182,7 +211,11 @@ chat-marks.ts   # 扩展主体（单文件，直接可用）
 
 | 版本 | 内容 |
 |------|------|
-| 2026-08 | 初始版本：右侧点列、鼠标悬停预览、点击跳转、滚动联动、键盘索引、发送自动跟随输出（持续迭代） |
+| v5 | **双模式兼容**：regular + fullscreen 双模式鼠标交互、视口指示、点击跳转全部可用 |
+| v4 | 点击点改为滚动对话区跳转（不再弹窗展示） |
+| v3 | 悬停改为编辑器上方非模态 widget 展示内容 |
+| v2 | 点列 overlay 加 nonCapturing，修掉启动抢焦点 |
+| v1 | 初始版本：右侧点列、鼠标悬停预览、点击跳转、滚动联动、键盘索引 |
 
 ---
 
