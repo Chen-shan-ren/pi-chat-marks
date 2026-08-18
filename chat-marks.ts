@@ -373,9 +373,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // regular 模式：只尝试跳转当前屏幕可见的消息
-    // DECScroll 只能操作当前屏幕缓冲区，无法到达 scrollback；
-    // 目标在屏幕外时通知用户手动滚动或使用键盘索引
+    // regular 模式：DECScroll 操作的是可见屏幕缓冲区而非 scrollback，
+    // 无法到达历史消息，且执行后黑屏。因此 regular 模式不做终端滚动，
+    // 目标在屏幕上就提示，不在 scrollback 中就告知用户用 Ctrl+Alt+M 键盘索引。
     try {
       const prevLines = t.previousLines ?? [];
       if (prevLines.length === 0) return false;
@@ -388,28 +388,21 @@ export default function (pi: ExtensionAPI) {
 
       const viewportTop = t.previousViewportTop ?? 0;
       const terminalHeight = termSize().rows;
-      // 目标行在可见屏幕上的行号
       const screenRow = matchRow - viewportTop;
-      // 屏幕外（在 scrollback 中）→ 无法用终端命令跳转
+
       if (screenRow < 0 || screenRow >= terminalHeight) {
-        // 尝试：如果目标行距离当前视口不远，用 DECScroll 滚动到可见范围
-        if (matchRow > viewportTop + terminalHeight) {
-          // 目标在视口下方（更新的内容），DECScroll 向下滚动
-          const delta = Math.min(matchRow - viewportTop - terminalHeight + Math.floor(terminalHeight / 2), 50);
-          if (delta > 0) t.terminal?.write?.(`\x1b[${delta}T`);
-        } else if (matchRow < viewportTop) {
-          // 目标在视口上方（scrollback 中），DECScroll 向上滚动
-          const delta = Math.min(viewportTop - matchRow + Math.floor(terminalHeight / 2), 50);
-          if (delta > 0) t.terminal?.write?.(`\x1b[${delta}S`);
-        }
-        t.requestRender?.();
-        sessionCtx?.ui.notify(`已尽量跳转，目标消息在第 ${index + 1}/${messages.length} 次发送（${fmtTime(target.timestamp)}）`, "info");
+        sessionCtx?.ui.notify(
+          `目标消息在滚动历史中，无法自动跳转（regular 模式限制）。请手动滚动，或使用 Ctrl+Alt+M 键盘索引`,
+          "warning",
+        );
         return true;
       }
 
-      // 目标已在屏幕上，直接高亮提示
       t.requestRender?.();
-      sessionCtx?.ui.notify(`已在屏幕上 · 第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, "info");
+      sessionCtx?.ui.notify(
+        `已在屏幕上 · 第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`,
+        "info",
+      );
       return true;
     } catch {
       return false;
@@ -558,7 +551,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // 启用 SGR 鼠标追踪（button + drag + all-motion + SGR format）
-    tui.terminal?.write?.("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
+    tui.terminal?.write?.("\x1b[?1000h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
     // 注册 inputListener（在 focused component 之前接收输入）
     if (tui.addInputListener) {
       regularMouseCleanup = tui.addInputListener((data: string) => {
@@ -577,7 +570,7 @@ export default function (pi: ExtensionAPI) {
     regularMouseCleanup?.();
     regularMouseCleanup = undefined;
     cachedTermSize = undefined;
-    tui.terminal?.write?.("\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    tui.terminal?.write?.("\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1000l");
   }
 
   /** regular 模式鼠标事件处理
