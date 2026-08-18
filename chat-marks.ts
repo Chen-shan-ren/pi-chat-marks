@@ -11,17 +11,21 @@
  *
  * 模式兼容：
  *   - fullscreen 模式：鼠标交互全部可用（点击/滚轮/hover/视口联动/跳转）
- *   - regular 模式：鼠标交互全部可用（通过终端鼠标追踪 + inputListener）
- *     点击跳转通过终端滚动命令实现；视口指示使用 previousViewportTop 近似
+ *   - regular 模式：鼠标悬停 + 点列滚轮 + 键盘索引可用；点击跳转仅当目标消息
+ *     在当前屏幕可见时可用（scrollback 内容无法通过终端命令精确跳转）
  *
  * 历史（修复记录）：
  *   - v1 用 modal overlay 弹窗展示详情，会抢占键盘焦点（未传 nonCapturing），
  *     导致重启后输入框无法打字；弹窗打开期间打字也被模态拦截。
  *   - v2 给常驻点列 overlay 加 nonCapturing: true，修掉启动即抢焦点的问题。
  *   - v3 点击点改为编辑器上方非模态 widget 展示内容。
- *   - v4（本版）按用户需求：点击点直接滚动对话区跳转到该消息，不做内容展示。
- *   - v5 双模式兼容：regular 模式下启用鼠标追踪 + inputListener，
- *     视口指示/跳转/悬停全部可用。
+ *   - v4 按用户需求：点击点直接滚动对话区跳转到该消息，不做内容展示。
+ *   - v5 双模式兼容：regular 模式下启用鼠标追踪 + inputListener。
+ *   - v6 修复 regular 模式 4 个 bug：
+ *     (a) 3 个多出来的点（termSize 未缓存，首帧尺寸与 overlay 位置不一致）
+ *     (b) 滑动中键全黑（handleRegularMouse 消费了区域外所有事件，拦截终端滚动）
+ *     (c) 鼠标移入点列区域才恢复（同 b，终端内容未被重绘）
+ *     (d) 点击不跳转（DECScroll 只能滚当前屏幕，无法到达 scrollback）
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -103,6 +107,10 @@ export default function (pi: ExtensionAPI) {
   let dotsTui: TuiInstance | undefined;
   let rowMapCache: { lines: string[]; map: Map<number, number> } | undefined;
 
+  // 缓存终端尺寸：overlay 回调时 tui.terminal.rows 可能未就绪，
+  // 需要缓存首次可用值，确保 renderDots / inDotsRegion / compositeOverlays 一致
+  let cachedTermSize: { rows: number; columns: number } | undefined;
+
   // regular 模式鼠标追踪状态
   let regularMouseEnabled = false;
   let regularMouseCleanup: (() => void) | undefined;
@@ -142,8 +150,9 @@ export default function (pi: ExtensionAPI) {
 
   // ---- 点列几何与渲染 ----
 
-  /** 终端当前尺寸：优先 tui.terminal，回退 process.stdout */
+  /** 终端当前尺寸：优先使用缓存值（overlay 回调时设置），回退 tui.terminal / process.stdout */
   function termSize(): { rows: number; columns: number } {
+    if (cachedTermSize) return cachedTermSize;
     const t = dotsTui;
     if (t?.terminal?.rows && t?.terminal?.columns) {
       return { rows: t.terminal.rows, columns: t.terminal.columns };
@@ -211,7 +220,6 @@ export default function (pi: ExtensionAPI) {
     const t = dotsTui;
     if (!t) return;
 
-    // 全屏模式：通过 getPrimaryScrollView 精确读取
     const fs = t as TuiFullscreenLike;
     if (fs.getPrimaryScrollView && fs.currentLayout) {
       try {
@@ -235,9 +243,7 @@ export default function (pi: ExtensionAPI) {
           t.requestRender?.();
           syncWindowToViewport();
         }
-      } catch {
-        // 静默
-      }
+      } catch { /* */ }
       return;
     }
 
@@ -246,7 +252,7 @@ export default function (pi: ExtensionAPI) {
       const prevLines = t.previousLines ?? [];
       if (prevLines.length === 0) return;
       const viewportTop = t.previousViewportTop ?? 0;
-      const terminalHeight = t.terminal?.rows ?? 30;
+      const terminalHeight = termSize().rows;
       const mid = Math.min(viewportTop + Math.floor(terminalHeight / 2), prevLines.length - 1);
       const map = getRowMap(prevLines);
       let markRow = -1;
@@ -262,9 +268,7 @@ export default function (pi: ExtensionAPI) {
         t.requestRender?.();
         syncWindowToViewport();
       }
-    } catch {
-      // 静默
-    }
+    } catch { /* */ }
   }
 
   // ---- 跳转到指定用户消息（双模式） ----
@@ -369,7 +373,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // regular 模式：使用 previousLines + 终端滚动命令
+    // regular 模式：只尝试跳转当前屏幕可见的消息
+    // DECScroll 只能操作当前屏幕缓冲区，无法到达 scrollback；
+    // 目标在屏幕外时通知用户手动滚动或使用键盘索引
     try {
       const prevLines = t.previousLines ?? [];
       if (prevLines.length === 0) return false;
@@ -381,28 +387,36 @@ export default function (pi: ExtensionAPI) {
       if (matchRow < 0) return false;
 
       const viewportTop = t.previousViewportTop ?? 0;
-      const terminalHeight = t.terminal?.rows ?? 30;
-      const targetScreenRow = matchRow - viewportTop;
-      const screenCenter = Math.floor(terminalHeight / 2);
-
-      if (targetScreenRow < 0 || targetScreenRow >= terminalHeight) {
-        const scrollDelta = targetScreenRow - screenCenter;
-        // DECScroll: \x1b[<n>S = scroll up (older content), \x1b[<n>T = scroll down (newer)
-        const cmd = scrollDelta > 0
-          ? `\x1b[${Math.abs(scrollDelta)}T`
-          : `\x1b[${Math.abs(scrollDelta)}S`;
-        t.terminal?.write?.(cmd);
+      const terminalHeight = termSize().rows;
+      // 目标行在可见屏幕上的行号
+      const screenRow = matchRow - viewportTop;
+      // 屏幕外（在 scrollback 中）→ 无法用终端命令跳转
+      if (screenRow < 0 || screenRow >= terminalHeight) {
+        // 尝试：如果目标行距离当前视口不远，用 DECScroll 滚动到可见范围
+        if (matchRow > viewportTop + terminalHeight) {
+          // 目标在视口下方（更新的内容），DECScroll 向下滚动
+          const delta = Math.min(matchRow - viewportTop - terminalHeight + Math.floor(terminalHeight / 2), 50);
+          if (delta > 0) t.terminal?.write?.(`\x1b[${delta}T`);
+        } else if (matchRow < viewportTop) {
+          // 目标在视口上方（scrollback 中），DECScroll 向上滚动
+          const delta = Math.min(viewportTop - matchRow + Math.floor(terminalHeight / 2), 50);
+          if (delta > 0) t.terminal?.write?.(`\x1b[${delta}S`);
+        }
+        t.requestRender?.();
+        sessionCtx?.ui.notify(`已尽量跳转，目标消息在第 ${index + 1}/${messages.length} 次发送（${fmtTime(target.timestamp)}）`, "info");
+        return true;
       }
 
+      // 目标已在屏幕上，直接高亮提示
       t.requestRender?.();
-      sessionCtx?.ui.notify(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, "info");
+      sessionCtx?.ui.notify(`已在屏幕上 · 第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, "info");
       return true;
     } catch {
       return false;
     }
   }
 
-  // ---- 鼠标钩子补丁（仅 fullscreen 需要，因为 regular 用 inputListener） ----
+  // ---- 鼠标钩子补丁（仅 fullscreen 需要） ----
 
   const PATCH_MARK = "__piMouseHook";
   const PATCH_ANCHOR =
@@ -531,10 +545,18 @@ export default function (pi: ExtensionAPI) {
 
   // ---- regular 模式鼠标追踪 ----
 
-  /** 在 regular 模式下启用终端 SGR 鼠标追踪 + inputListener */
+  /** 在 regular 模式下启用终端 SGR 鼠标追踪 + inputListener
+   *  关键：只消费点列区域内的鼠标事件，区域外全部放行给终端，
+   *  保证终端原生滚动（scrollback 导航）不被拦截。 */
   function enableRegularMouse(tui: TuiInstance): void {
     if (regularMouseEnabled) return;
     regularMouseEnabled = true;
+
+    // 缓存终端尺寸（此时 tui.terminal 已就绪）
+    if (tui.terminal?.rows && tui.terminal?.columns) {
+      cachedTermSize = { rows: tui.terminal.rows, columns: tui.terminal.columns };
+    }
+
     // 启用 SGR 鼠标追踪（button + drag + all-motion + SGR format）
     tui.terminal?.write?.("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
     // 注册 inputListener（在 focused component 之前接收输入）
@@ -554,12 +576,14 @@ export default function (pi: ExtensionAPI) {
     regularMouseEnabled = false;
     regularMouseCleanup?.();
     regularMouseCleanup = undefined;
+    cachedTermSize = undefined;
     tui.terminal?.write?.("\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
   }
 
-  /** regular 模式鼠标事件处理 */
+  /** regular 模式鼠标事件处理
+   *  只消费点列区域内的事件；区域外全部放行（返回 undefined），
+   *  保证终端原生滚轮/拖拽/点击不受干扰。 */
   function handleRegularMouse(data: string): { consume?: boolean } | undefined {
-    dotsTui = dotsTui; // ensure reference
     const mouse = parseSgrMouse(data);
     if (!mouse) return undefined;
 
@@ -567,25 +591,16 @@ export default function (pi: ExtensionAPI) {
     const isMove = mouse.button >= 32 && mouse.button < 64;
     const isWheel = mouse.button >= 64;
 
+    // ---- 点列区域外：不消费事件，全部放行给终端 ----
     if (!inDotsRegion(mouse.x, mouse.y)) {
-      // 点列区域外
+      // 仅在离开点列区域时清除悬停状态（不消费事件，终端正常处理）
       if ((isMove || (btn === 0 && mouse.press)) && hoverIndex !== -1) {
         hoverIndex = -1;
         updateHoverPreview();
         dotsTui?.requestRender?.();
       }
-      // 区域外的滚轮：转为终端滚动（DECScroll）
-      if (isWheel) {
-        const direction = btn === 0 ? -1 : 1;
-        const lines = Math.abs(direction) * 3;
-        const cmd = direction > 0
-          ? `\x1b[${lines}T`  // 向下滚（看更新的内容）
-          : `\x1b[${lines}S`; // 向上滚（看更早的内容）
-        dotsTui?.terminal?.write?.(cmd);
-        return { consume: true };
-      }
-      // 区域外的点击/移动：消费掉，避免干扰 pi 编辑器
-      return { consume: true };
+      // 返回 undefined = 不消费，终端继续处理滚轮/拖拽/点击
+      return undefined;
     }
 
     // ---- 点列区域内 ----
@@ -793,14 +808,13 @@ export default function (pi: ExtensionAPI) {
     viewportIndex = -1;
     sessionCtx = ctx;
     dotsTui = undefined;
+    cachedTermSize = undefined;
     if (!ctx.hasUI || ctx.mode !== "tui") return;
 
-    // 安装滚动钩子（两种模式的 ScrollView 共用 scroll-view.js）
     (globalThis as unknown as Record<string, unknown>)["__piScrollHook"] = () => {
       updateViewportIndicator();
     };
 
-    // 读取历史消息
     try {
       for (const entry of ctx.sessionManager.getEntries()) {
         if (entry.type === "message" && entry.message?.role === "user") {
@@ -816,19 +830,15 @@ export default function (pi: ExtensionAPI) {
       }
     } catch { /* */ }
 
-    // 常驻点列 overlay（贴右边缘，滚动条左侧）
     void ctx.ui.custom((tui, theme) => {
       dotsTui = tui as TuiInstance;
 
-      // 模式检测 + 鼠标初始化
       const fullscreen = isFullscreenTui(tui as TuiInstance);
       if (fullscreen) {
-        // fullscreen：注册鼠标钩子到 globalThis（tui-alt-screen.js 补丁调用）
         (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = (data: string, t: unknown) =>
           handleMouse(data, t as never);
         log("[chat-marks] fullscreen 模式：已注册 __piMouseHook");
       } else {
-        // regular：启用终端鼠标追踪 + inputListener
         enableRegularMouse(tui as TuiInstance);
       }
 
@@ -848,7 +858,6 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    // 等 transcript 布局渲染完成后：强制滚到底部并同步视口指示
     setTimeout(() => {
       try {
         const fs = dotsTui as TuiFullscreenLike;
@@ -884,7 +893,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     (globalThis as unknown as Record<string, unknown>)["__piMouseHook"] = undefined;
     (globalThis as unknown as Record<string, unknown>)["__piScrollHook"] = undefined;
-    // 清理 regular 模式鼠标追踪
     if (dotsTui) {
       disableRegularMouse(dotsTui);
     }
@@ -901,6 +909,5 @@ export default function (pi: ExtensionAPI) {
     handler: (_args, ctx) => openMarks(ctx),
   });
 
-  // 补丁放在最后（所有常量已初始化）
   ensureAltScreenPatches();
 }
