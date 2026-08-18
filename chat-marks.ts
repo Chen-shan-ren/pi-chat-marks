@@ -6,20 +6,28 @@
  *
  * 模式路由：
  *   - fullscreen（--tui-mode fullscreen）：全部功能可用
- *   - regular（默认）：点阵 + 键盘索引（Ctrl+Alt+M），无鼠标交互
+ *   - regular（默认）：全部功能可用
  *
- * 两种模式使用不同的 TUI 架构，overlay 定位和滚动控制方式根本不同：
- *   fullscreen → renderLayoutFrame + ScrollView → overlay 屏幕相对，始终可见
- *   regular    → render(width) 全部内容       → overlay 内容相对，随内容滚动
- * 因此 regular 模式无法实现 fullscreen 的鼠标交互效果。
+ * 两种模式的实现差异：
+ *   fullscreen → renderLayoutFrame + ScrollView（pi 自己控制视图滚动）
+ *   regular    → 渲染进终端主屏，视图由终端控制
+ *
+ * regular 模式的技术方案（v7）：
+ *   - 终端鼠标追踪（SGR 1000/1003/1006）+ inputListener 接收鼠标
+ *   - 滚动/跳转 = 给 tui-main-screen.js 打补丁，支持"强制视口切片渲染"：
+ *     清屏后只重绘 [top, top+height) 切片，previousViewportTop 记账保持一致，
+ *     避免 v5 直接写 DECSCROLL 导致的失同步黑屏
+ *   - 持久视口合成：滚动时点列仍固定在屏幕右侧（与 fullscreen 一致）
+ *   - renderNow 钩子：每次渲染后同步视口位置指示 + 修正光标记账
  *
  * 历史：
  *   v1  modal overlay 弹窗（抢占键盘焦点）
  *   v2  nonCapturing overlay
  *   v3  编辑器上方 widget 展示
  *   v4  点击跳转
- *   v5  regular 模式尝试（受限于架构）
- *   v6  正确的路由架构：fullscreen 完整功能，regular 精简功能
+ *   v5  regular 模式尝试（DECSCROLL 方案：终端不交互 scrollback → 黑屏，弃用）
+ *   v6  路由架构：fullscreen 完整功能，regular 精简功能
+ *   v7  强制视口切片渲染：regular 模式功能与 fullscreen 对齐
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -27,6 +35,7 @@ import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, SelectList, Text, matchesKey } from "@earendil-works/pi-tui";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { tmpdir } from "node:os";
 
 // ===========================================================================
 // 共用类型
@@ -60,8 +69,12 @@ function stripAnsi(s: string): string {
 
 interface TuiBaseLike {
   terminal?: { rows?: number; columns?: number; write?: (data: string) => void };
-  requestRender?: () => void;
+  requestRender?: (force?: boolean) => void;
   addInputListener?: (fn: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
+  previousLines?: string[];
+  previousViewportTop?: number;
+  hardwareCursorRow?: number;
+  mode?: string;
 }
 
 interface TuiFullscreenLike extends TuiBaseLike {
@@ -148,7 +161,7 @@ function buildRowMap(lines: string[], messages: UserMsg[]): Map<number, number> 
 }
 
 // ===========================================================================
-// 补丁系统（仅 fullscreen 模式需要）
+// 补丁系统
 // ===========================================================================
 
 const PATCH_MARK = "__piMouseHook";
@@ -196,6 +209,113 @@ const PATCH5_ANCHOR =
 const PATCH5_INSERT =
   "        if (moved !== 0 || this.followingEnd !== wasFollowingEnd)\n            this.requestRenderCallback?.();\n        // [chat-marks-patch] __piScrollHookBy\n        globalThis.__piScrollHook?.(this);\n        return requested - moved;";
 
+// PATCH6A/6B 打在 tui.js（TuiBase，两种模式共用）：渲染完成钩子。
+// 注意：regular 模式的渲染直接调 doRender()（requestImmediateRender / scheduleRender），
+// 不经过 renderNow()，所以钩子必须打在两个 doRender 调用点。
+const PATCH6A_MARK = "__piDoRenderHookA";
+const PATCH6A_ANCHOR =
+  "            this.renderRequested = false;\n" +
+  "            this.lastRenderAt = performance.now();\n" +
+  "            this.doRender();\n" +
+  "        });\n" +
+  "    }\n" +
+  "    cancelRenderTimer() {";
+const PATCH6A_INSERT =
+  "            this.renderRequested = false;\n" +
+  "            this.lastRenderAt = performance.now();\n" +
+  "            this.doRender();\n" +
+  "            // [chat-marks-patch] __piDoRenderHookA\n" +
+  "            globalThis.__piScrollHook?.(this);\n" +
+  "        });\n" +
+  "    }\n" +
+  "    cancelRenderTimer() {";
+const PATCH6B_MARK = "__piDoRenderHookB";
+const PATCH6B_ANCHOR =
+  "            this.doRender();\n" +
+  "            if (this.renderRequested) {\n" +
+  "                this.scheduleRender();\n" +
+  "            }";
+const PATCH6B_INSERT =
+  "            this.doRender();\n" +
+  "            // [chat-marks-patch] __piDoRenderHookB\n" +
+  "            globalThis.__piScrollHook?.(this);\n" +
+  "            if (this.renderRequested) {\n" +
+  "                this.scheduleRender();\n" +
+  "            }";
+const PATCH7_MARK = "__piViewportComposite";
+const PATCH7_ANCHOR = "        const viewportStart = Math.max(0, workingHeight - termHeight);";
+const PATCH7_INSERT =
+  "        // [chat-marks-patch] __piViewportComposite\n" +
+  "        const viewportStart = globalThis.__piViewportTop !== undefined\n" +
+  "            ? globalThis.__piViewportTop\n" +
+  "            : Math.max(0, workingHeight - termHeight);";
+
+// PATCH8/9 打在 tui-main-screen.js（regular 模式渲染器）
+const PATCH8_MARK = "__piCompositeSkip";
+const PATCH8_ANCHOR =
+  "        if (this.hasOverlayEntries) {\n" +
+  "            newLines = this.compositeOverlays(newLines, width, height);\n" +
+  "        }";
+const PATCH8_INSERT =
+  "        if (this.hasOverlayEntries && globalThis.__piForcedViewportTop === undefined) { // [chat-marks-patch] __piCompositeSkip\n" +
+  "            newLines = this.compositeOverlays(newLines, width, height);\n" +
+  "        }";
+const PATCH9_MARK = "__piForcedSlice";
+const PATCH9_ANCHOR =
+  "            let buffer = \"\\x1b[?2026h\"; // Begin synchronized output\n" +
+  "            if (clear) {\n" +
+  "                buffer += this.deleteKittyImages(this.previousKittyImageIds);\n" +
+  "                buffer += \"\\x1b[2J\\x1b[H\\x1b[3J\"; // Clear screen, home, then clear scrollback\n" +
+  "            }\n" +
+  "            for (let i = 0; i < newLines.length; i++) {";
+const PATCH9_INSERT =
+  "            let buffer = \"\\x1b[?2026h\"; // Begin synchronized output\n" +
+  "            if (clear) {\n" +
+  "                buffer += this.deleteKittyImages(this.previousKittyImageIds);\n" +
+  "                buffer += \"\\x1b[2J\\x1b[H\\x1b[3J\"; // Clear screen, home, then clear scrollback\n" +
+  "            }\n" +
+  "            // [chat-marks-patch] __piForcedSlice: forced viewport slice render (chat-marks regular mode)\n" +
+  "            const __piForcedTop = globalThis.__piForcedViewportTop;\n" +
+  "            if (__piForcedTop !== undefined) {\n" +
+  "                globalThis.__piForcedViewportTop = undefined;\n" +
+  "                if (!newLines.some((l) => typeof l === \"string\" && isImageLine(l))) {\n" +
+  "                    const __piTop = Math.max(0, Math.min(__piForcedTop, Math.max(0, newLines.length - height)));\n" +
+  "                    const __piEnd = Math.min(newLines.length, __piTop + height);\n" +
+  "                    let __piSlice = newLines.slice(__piTop, __piEnd);\n" +
+  "                    const __piSaved = globalThis.__piViewportTop;\n" +
+  "                    globalThis.__piViewportTop = undefined;\n" +
+  "                    if (this.hasOverlayEntries) {\n" +
+  "                        __piSlice = this.compositeOverlays(__piSlice, width, height);\n" +
+  "                    }\n" +
+  "                    globalThis.__piViewportTop = __piSaved;\n" +
+  "                    let __piBuf = \"\\x1b[?2026h\";\n" +
+  "                    __piBuf += this.deleteKittyImages(this.previousKittyImageIds);\n" +
+  "                    __piBuf += \"\\x1b[2J\\x1b[H\\x1b[3J\";\n" +
+  "                    for (let i = 0; i < __piSlice.length; i++) {\n" +
+  "                        if (i > 0)\n" +
+  "                            __piBuf += \"\\r\\n\";\n" +
+  "                        __piBuf += __piSlice[i] ?? \"\";\n" +
+  "                    }\n" +
+  "                    __piBuf += \"\\x1b[?2026l\";\n" +
+  "                    this.terminal.write(__piBuf);\n" +
+  "                    this.cursorRow = Math.max(0, __piEnd - 1);\n" +
+  "                    this.hardwareCursorRow = this.cursorRow;\n" +
+  "                    this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);\n" +
+  "                    this.previousViewportTop = __piTop;\n" +
+  "                    this.previousLines = newLines;\n" +
+  "                    this.previousKittyImageIds = this.collectKittyImageIds(newLines);\n" +
+  "                    this.previousWidth = width;\n" +
+  "                    this.previousHeight = height;\n" +
+  "                    if (cursorPos && cursorPos.row >= __piTop && cursorPos.row < __piEnd) {\n" +
+  "                        this.positionHardwareCursor(cursorPos, newLines.length);\n" +
+  "                    } else {\n" +
+  "                        this.terminal.hideCursor();\n" +
+  "                    }\n" +
+  "                    return;\n" +
+  "                }\n" +
+  "            }\n" +
+  "            for (let i = 0; i < newLines.length; i++) {";
+
 function findTuiAltScreenPath(): string | undefined {
   const candidates: string[] = [];
   try {
@@ -227,11 +347,25 @@ function findScrollViewPath(): string | undefined {
   return existsSync(p) ? p : undefined;
 }
 
+function findTuiJsPath(): string | undefined {
+  const alt = findTuiAltScreenPath();
+  if (!alt) return undefined;
+  const p = join(dirname(alt), "tui.js");
+  return existsSync(p) ? p : undefined;
+}
+
+function findTuiMainScreenPath(): string | undefined {
+  const alt = findTuiAltScreenPath();
+  if (!alt) return undefined;
+  const p = join(dirname(alt), "tui-main-screen.js");
+  return existsSync(p) ? p : undefined;
+}
+
 function applyIdempotentPatch(file: string, mark: string, anchor: string, insert: string, label: string, warn: (msg: string) => void): boolean {
   const src = readFileSync(file, "utf8");
   if (src.includes(mark)) return true;
   if (!src.includes(anchor)) {
-    warn(`[chat-marks] tui-alt-screen.js 版本不匹配，无法打补丁（${label}）`);
+    warn(`[chat-marks] pi 版本不匹配，无法打补丁（${label}）`);
     return false;
   }
   writeFileSync(file, src.replace(anchor, insert), "utf8");
@@ -256,6 +390,23 @@ function applyPatches(log: (msg: string) => void, warn: (msg: string) => void): 
   } else {
     applyIdempotentPatch(scrollFile, PATCH4_MARK, PATCH4_ANCHOR, PATCH4_INSERT, "滚动钩子 scrollTo", warn);
     applyIdempotentPatch(scrollFile, PATCH5_MARK, PATCH5_ANCHOR, PATCH5_INSERT, "滚动钩子 scrollBy", warn);
+  }
+  const tuiJs = findTuiJsPath();
+  if (!tuiJs) {
+    if (!problem) problem = "未找到 tui.js，regular 模式视口联动不可用";
+    warn("[chat-marks] 未找到 tui.js");
+  } else {
+    applyIdempotentPatch(tuiJs, PATCH6A_MARK, PATCH6A_ANCHOR, PATCH6A_INSERT, "渲染钩子 immediate", warn);
+    applyIdempotentPatch(tuiJs, PATCH6B_MARK, PATCH6B_ANCHOR, PATCH6B_INSERT, "渲染钩子 throttled", warn);
+    applyIdempotentPatch(tuiJs, PATCH7_MARK, PATCH7_ANCHOR, PATCH7_INSERT, "视口合成", warn);
+  }
+  const mainScreen = findTuiMainScreenPath();
+  if (!mainScreen) {
+    if (!problem) problem = "未找到 tui-main-screen.js，regular 模式滚动/跳转不可用";
+    warn("[chat-marks] 未找到 tui-main-screen.js");
+  } else {
+    applyIdempotentPatch(mainScreen, PATCH8_MARK, PATCH8_ANCHOR, PATCH8_INSERT, "合成跳过", warn);
+    applyIdempotentPatch(mainScreen, PATCH9_MARK, PATCH9_ANCHOR, PATCH9_INSERT, "强制切片", warn);
   }
   return problem;
 }
@@ -345,7 +496,7 @@ function createFullscreenHandler(messages: UserMsg[], ctx: ExtensionContext) {
     return visit((frame as { root?: unknown })?.root as { scrollView?: unknown; children?: unknown[] });
   }
 
-  function updateViewportIndicator() {
+  function updateViewportIndicator(_t?: unknown) {
     try {
       const sv = dotsTui.getPrimaryScrollView();
       if (sv.viewportHeight <= 0) return;
@@ -476,8 +627,6 @@ function createFullscreenHandler(messages: UserMsg[], ctx: ExtensionContext) {
       // 注册鼠标钩子到 globalThis（tui-alt-screen.js 补丁调用）
       (globalThis as Record<string, unknown>)["__piMouseHook"] = (data: string, t: unknown) =>
         handleMouse(data, t as TuiFullscreenLike);
-      // 滚动钩子
-      (globalThis as Record<string, unknown>)["__piScrollHook"] = () => updateViewportIndicator();
 
       return {
         render: (w: number) => renderDots(w, theme),
@@ -488,7 +637,6 @@ function createFullscreenHandler(messages: UserMsg[], ctx: ExtensionContext) {
 
     cleanup() {
       (globalThis as Record<string, unknown>)["__piMouseHook"] = undefined;
-      (globalThis as Record<string, unknown>)["__piScrollHook"] = undefined;
     },
 
     scrollToBottom() {
@@ -501,39 +649,307 @@ function createFullscreenHandler(messages: UserMsg[], ctx: ExtensionContext) {
 }
 
 // ===========================================================================
-// Regular Handler — 点阵 + 键盘索引（无鼠标交互）
+// Regular Handler — 完整鼠标交互 + 视口联动（强制视口切片渲染）
 // ===========================================================================
 
 function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
-  let dotsTui: TuiBaseLike;
+  let dotsTui: TuiBaseLike & { previousLines?: string[]; previousViewportTop?: number; hardwareCursorRow?: number };
+  let cachedSize: { rows: number; columns: number } | undefined;
+  let hoverIndex = -1;
+  let viewportIndex = -1;
+  let scrollOffset = 0;
+  let mouseEnabled = false;
+  let mouseCleanup: (() => void) | undefined;
+  let rowMapCache: { lines: string[]; map: Map<number, number> } | undefined;
 
-  function termSize() {
-    return {
-      rows: dotsTui?.terminal?.rows ?? process.stdout?.rows ?? 30,
-      columns: dotsTui?.terminal?.columns ?? process.stdout?.columns ?? 80,
-    };
+  const dbg = (msg: string) => {
+    if (process.env.CHAT_MARKS_DEBUG !== "1") return;
+    try {
+      writeFileSync(join(tmpdir(), "chat-marks-regular.log"), `[${new Date().toISOString()}] ${msg}\n`, { flag: "a" });
+    } catch { /* */ }
+  };
+
+  const g = (globalThis as Record<string, unknown>);
+
+  // ---- 终端尺寸（缓存首次可用值，避免 v5 的"多 3 个点"问题） ----
+
+  function termSize(): { rows: number; columns: number } {
+    if (cachedSize) return cachedSize;
+    const rows = dotsTui?.terminal?.rows ?? process.stdout?.rows ?? 30;
+    const columns = dotsTui?.terminal?.columns ?? process.stdout?.columns ?? 80;
+    if (dotsTui?.terminal?.rows && dotsTui?.terminal?.columns) cachedSize = { rows, columns };
+    return { rows, columns };
   }
 
   function dotsMaxRows() { return Math.max(4, Math.min(18, termSize().rows - 8)); }
   function dotsCount() { return Math.min(messages.length, dotsMaxRows()); }
 
+  function clampOffset() {
+    const max = Math.max(0, messages.length - dotsCount());
+    scrollOffset = Math.max(0, Math.min(scrollOffset, max));
+  }
+
+  function dotsTopRow() { return Math.max(0, Math.floor((termSize().rows - dotsCount()) / 2)); }
+
+  function indexAtRow(y: number): number {
+    const v = y - 1 - dotsTopRow();
+    const i = scrollOffset + v;
+    return i >= 0 && i < messages.length ? i : -1;
+  }
+
+  function inDotsRegion(x: number, y: number): boolean {
+    const { columns, rows } = termSize();
+    if (x < columns - 2 || x > columns - 1) return false;
+    const count = dotsCount();
+    if (count === 0) return false;
+    const top = dotsTopRow();
+    return y >= top + 1 && y <= top + count && y <= rows;
+  }
+
   function renderDots(width: number, theme: {
     fg(color: string, s: string): string;
     bold(s: string): string;
+    bg(color: string, s: string): string;
   }): string[] {
+    clampOffset();
     const count = dotsCount();
     const rows: string[] = [];
-    for (let i = Math.max(0, messages.length - count); i < messages.length; i++) {
-      const isLast = i === messages.length - 1;
-      const dot = isLast ? theme.fg("success", "●") : theme.fg("muted", "•");
+    for (let v = 0; v < count; v++) {
+      const i = scrollOffset + v;
+      let dot: string;
+      if (i === hoverIndex) {
+        dot = theme.bold(theme.fg("accent", theme.bg("selectedBg", "⬤")));
+      } else if (i === viewportIndex) {
+        dot = theme.fg("warning", "◉");
+      } else if (i === messages.length - 1) {
+        dot = theme.fg("success", "●");
+      } else {
+        dot = theme.fg("muted", "•");
+      }
       rows.push(width > 1 ? " " + dot : dot);
     }
     return rows;
   }
 
+  // ---- 行映射（标记行 → 消息索引） ----
+
+  function getRowMap(lines: string[]): Map<number, number> {
+    if (rowMapCache && rowMapCache.lines === lines) return rowMapCache.map;
+    const map = buildRowMap(lines, messages);
+    rowMapCache = { lines, map };
+    return map;
+  }
+
+  // ---- 视口控制：强制切片渲染 ----
+
+  /** 当前视口顶行（扩展记账；未滚动时跟随 pi 的记账） */
+  function currentViewportTop(): number {
+    const forced = g["__piViewportTop"];
+    if (typeof forced === "number") return forced;
+    return dotsTui?.previousViewportTop ?? 0;
+  }
+
+  /** 强制渲染 [top, top+height) 切片（清屏 + 重绘，记账保持一致） */
+  function setViewport(top: number): void {
+    const t = dotsTui;
+    if (!t) return;
+    const rows = termSize().rows;
+    const contentLen = t.previousLines?.length ?? 0;
+    const maxTop = Math.max(0, contentLen - rows);
+    const target = Math.max(0, Math.min(top, maxTop));
+    if (target === currentViewportTop() && target === (g["__piForcedViewportTop"] ?? -1)) return;
+    dbg(`setViewport top=${target} (was ${currentViewportTop()}, content=${contentLen}, rows=${rows})`);
+    g["__piForcedViewportTop"] = target;
+    g["__piViewportTop"] = target;
+    t.requestRender?.(true);
+  }
+
+  /** 滚轮滚动对话区（delta 行；正=更新内容方向） */
+  function scrollTranscript(delta: number): void {
+    const t = dotsTui;
+    if (!t) return;
+    const rows = termSize().rows;
+    const contentLen = t.previousLines?.length ?? 0;
+    const maxTop = Math.max(0, contentLen - rows);
+    if (maxTop <= 0) return;
+    const target = Math.max(0, Math.min(currentViewportTop() + delta, maxTop));
+    if (target === currentViewportTop()) return;
+    setViewport(target);
+  }
+
+  /** 跳转到第 index 条用户消息（视图居中） */
+  function jumpToMessage(index: number): boolean {
+    const t = dotsTui;
+    const target = messages[index];
+    if (!t || !target) return false;
+    const lines = t.previousLines ?? [];
+    if (lines.length === 0) return false;
+    const map = getRowMap(lines);
+    let matchRow = -1;
+    for (const [row, msgIdx] of map) {
+      if (msgIdx === index) { matchRow = row; break; }
+    }
+    if (matchRow < 0) return false;
+    const rows = termSize().rows;
+    const top = Math.max(0, Math.min(matchRow - Math.floor(rows / 2), Math.max(0, lines.length - rows)));
+    dbg(`jumpToMessage idx=${index} row=${matchRow} top=${top}`);
+    setViewport(top);
+    ctx.ui.notify(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, "info");
+    return true;
+  }
+
+  // ---- 视口指示 ----
+
+  function syncWindowToViewport() {
+    const count = dotsCount();
+    if (count <= 0 || viewportIndex < 0) return;
+    const maxOffset = Math.max(0, messages.length - count);
+    if (viewportIndex >= scrollOffset && viewportIndex < scrollOffset + count) return;
+    let target: number;
+    if (viewportIndex >= messages.length - count) {
+      target = maxOffset;
+    } else {
+      target = Math.max(0, Math.min(maxOffset, viewportIndex - Math.floor(count / 2)));
+    }
+    if (target !== scrollOffset) { scrollOffset = target; dotsTui?.requestRender?.(); }
+  }
+
+  /**
+   * 渲染后同步（由 __piScrollHook 调用，参数为 TUI 实例）。
+   * 1) pi 自己把视图移回底部（追加内容）时，清除持久视口；
+   * 2) 修正 hardwareCursorRow 记账（pi 的 positionHardwareCursor 会写入越界值）；
+   * 3) 计算视口位置的黄色指示点。
+   */
+  function updateViewportIndicator(t?: unknown): void {
+    const tui = (t ?? dotsTui) as typeof dotsTui | undefined;
+    if (!tui) return;
+    const forced = g["__piViewportTop"];
+    const pvt = tui.previousViewportTop ?? 0;
+    if (typeof forced === "number" && pvt !== forced) {
+      g["__piViewportTop"] = undefined;
+      dbg(`viewport reconciled to pi bookkeeping: ${pvt} (was forced ${forced})`);
+      // 视图已回到底部：立即重渲染一次，让点列在底部重新合成
+      tui.requestRender?.();
+    }
+    const top = currentViewportTop();
+    const rows = termSize().rows;
+    const bottom = top + rows - 1;
+    if ((tui.hardwareCursorRow ?? 0) > bottom) tui.hardwareCursorRow = bottom;
+    const lines = tui.previousLines ?? [];
+    if (lines.length === 0) return;
+    const mid = Math.min(top + Math.floor(rows / 2), lines.length - 1);
+    const map = getRowMap(lines);
+    let markRow = -1;
+    for (let row = mid; row >= 0; row--) {
+      if (OSC133_PROMPT_START.test(lines[row] ?? "") && map.has(row)) {
+        markRow = row; break;
+      }
+    }
+    const next = markRow >= 0 ? (map.get(markRow) ?? -1) : -1;
+    if (next !== viewportIndex) {
+      viewportIndex = next;
+      tui.requestRender?.();
+      syncWindowToViewport();
+    }
+  }
+
+  // ---- 鼠标追踪 ----
+
+  function enableMouse(tui: TuiBaseLike): void {
+    if (mouseEnabled) return;
+    // 逃生舱：CHAT_MARKS_NO_REGULAR_MOUSE=1 关闭鼠标追踪（恢复终端原生滚动/选择，点列仅键盘）
+    if (process.env.CHAT_MARKS_NO_REGULAR_MOUSE === "1") {
+      dbg("mouse tracking disabled by CHAT_MARKS_NO_REGULAR_MOUSE");
+      return;
+    }
+    mouseEnabled = true;
+    // SGR 鼠标追踪：1000 按钮 + 1003 全移动 + 1006 SGR 格式
+    tui.terminal?.write?.("\x1b[?1000h\x1b[?1003h\x1b[?1006h");
+    if (tui.addInputListener) {
+      mouseCleanup = tui.addInputListener((data: string) => {
+        if (typeof data !== "string" || !data.startsWith("\x1b[<")) return undefined;
+        return handleMouse(data);
+      });
+    }
+    dbg("mouse tracking enabled");
+  }
+
+  function disableMouse(tui: TuiBaseLike): void {
+    if (!mouseEnabled) return;
+    mouseEnabled = false;
+    mouseCleanup?.();
+    mouseCleanup = undefined;
+    tui.terminal?.write?.("\x1b[?1003l\x1b[?1000l\x1b[?1006l");
+    dbg("mouse tracking disabled");
+  }
+
+  function updateHoverPreview() {
+    if (hoverIndex >= 0 && hoverIndex < messages.length) {
+      const m = messages[hoverIndex];
+      ctx.ui.setWidget("chat-marks-preview", [
+        `⏱ ${fmtTime(m.timestamp)} · 第 ${hoverIndex + 1} 次发送`,
+        preview(m.text, 60),
+      ]);
+    } else {
+      ctx.ui.setWidget("chat-marks-preview", undefined);
+    }
+  }
+
+  function handleMouse(data: string): { consume?: boolean } | undefined {
+    const mouse = parseSgrMouse(data);
+    if (!mouse) return undefined;
+
+    const btn = mouse.button & 3;
+    const isMove = mouse.button >= 32 && mouse.button < 64;
+    const isWheel = mouse.button >= 64;
+    dbg(`mouse btn=${mouse.button} x=${mouse.x} y=${mouse.y} ${mouse.press ? "press" : "release"}`);
+
+    if (!inDotsRegion(mouse.x, mouse.y)) {
+      // 点列区域外
+      if ((isMove || (btn === 0 && mouse.press)) && hoverIndex !== -1) {
+        hoverIndex = -1; updateHoverPreview(); dotsTui?.requestRender?.();
+      }
+      if (isWheel) {
+        // 滚轮滚动对话区（视图由扩展控制；不再用 DECSCROLL，避免与 pi 记账失同步）
+        scrollTranscript(btn === 0 ? -3 : 3);
+        return { consume: true };
+      }
+      return { consume: true };
+    }
+
+    // ---- 点列区域内 ----
+    const target = indexAtRow(mouse.y);
+
+    if (isMove) {
+      if (target !== hoverIndex) { hoverIndex = target; updateHoverPreview(); dotsTui?.requestRender?.(); }
+      return { consume: true };
+    }
+    if (isWheel) {
+      if (btn === 0) scrollOffset--; else scrollOffset++;
+      clampOffset(); dotsTui?.requestRender?.();
+      return { consume: true };
+    }
+    if (btn === 0 && mouse.press) {
+      if (target >= 0) {
+        hoverIndex = -1; updateHoverPreview();
+        const ok = jumpToMessage(target);
+        if (!ok) ctx.ui.notify("未能在对话区定位到该消息（可能已被折叠或不在当前会话）", "warning");
+        dotsTui?.requestRender?.();
+      }
+      return { consume: true };
+    }
+    if (btn === 1 || btn === 2 || !mouse.press) return { consume: true };
+    return { consume: true };
+  }
+
+  // ---- 初始化 ----
   return {
     init(tui: TuiBaseLike, theme: { fg: (c: string, s: string) => string; bold: (s: string) => string; bg: (c: string, s: string) => string }) {
       dotsTui = tui;
+      const rows = tui.terminal?.rows ?? process.stdout?.rows ?? 30;
+      const columns = tui.terminal?.columns ?? process.stdout?.columns ?? 80;
+      cachedSize = { rows, columns };
+      enableMouse(tui);
       return {
         render: (w: number) => renderDots(w, theme),
         invalidate: () => {},
@@ -541,11 +957,16 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       };
     },
 
-    cleanup() { /* 无鼠标追踪，无需清理 */ },
+    cleanup() {
+      if (dotsTui) disableMouse(dotsTui);
+      g["__piViewportTop"] = undefined;
+      g["__piForcedViewportTop"] = undefined;
+    },
 
-    scrollToBottom() { /* regular 模式无此能力 */ },
+    scrollToBottom() { /* regular 模式：pi 原生渲染即回底部，无需处理 */ },
 
-    updateViewportIndicator() { /* regular 模式无法检测终端滚动 */ },
+    jumpToMessage,
+    updateViewportIndicator,
   };
 }
 
@@ -590,9 +1011,9 @@ export default function (pi: ExtensionAPI) {
       const list = new SelectList(items, Math.min(items.length, 12), getSelectListTheme());
       list.onSelect = (item) => {
         const idx = Number(item.value);
-        // 尝试跳转（fullscreen 模式有效，regular 模式静默忽略）
-        const fsHandler = handler as ReturnType<typeof createFullscreenHandler> | undefined;
-        if (fsHandler && typeof fsHandler.jumpToMessage === "function") fsHandler.jumpToMessage(idx);
+        const ok = handler?.jumpToMessage?.(idx) ?? false;
+        if (!ok) {
+          ctx.ui.notify("未能在对话区定位到该消息（可能已被折叠或不在当前会话）", "warning");
         }
         done(undefined);
       };
@@ -630,6 +1051,11 @@ export default function (pi: ExtensionAPI) {
     sessionCtx = ctx;
     if (!ctx.hasUI || ctx.mode !== "tui") return;
 
+    // 渲染钩子（PATCH6 renderNow + PATCH4/5 scroll-view 共用；regular 由扩展控制视图）
+    (globalThis as Record<string, unknown>)["__piScrollHook"] = (t?: unknown) => {
+      handler?.updateViewportIndicator?.(t);
+    };
+
     // 读取历史消息
     try {
       for (const entry of ctx.sessionManager.getEntries()) {
@@ -649,10 +1075,10 @@ export default function (pi: ExtensionAPI) {
         log("[chat-marks] fullscreen 模式：完整功能已启用");
         return overlay;
       } else {
-        // ---- regular 模式：点阵 + 键盘 ----
+        // ---- regular 模式：完整功能（强制视口切片渲染） ----
         handler = createRegularHandler(messages, ctx);
         const overlay = handler.init(tui as TuiInstance, theme);
-        log("[chat-marks] regular 模式：点阵 + 键盘索引已启用");
+        log("[chat-marks] regular 模式：完整功能已启用（鼠标追踪 + 视口切片）");
         return overlay;
       }
     }, {
@@ -666,7 +1092,7 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    // 全屏模式：等布局完成后滚到底部 + 同步视口
+    // 等布局完成后滚到底部 + 同步视口
     setTimeout(() => {
       handler?.scrollToBottom?.();
       handler?.updateViewportIndicator?.();
@@ -688,6 +1114,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     handler?.cleanup?.();
+    (globalThis as Record<string, unknown>)["__piScrollHook"] = undefined;
     sessionCtx = undefined;
   });
 

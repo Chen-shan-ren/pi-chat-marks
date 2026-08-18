@@ -29,14 +29,14 @@
                                      ↑ 滚动条
 ```
 
-> **⚠️ 需要 fullscreen 模式才能获得完整鼠标交互。** regular 模式下仅提供点阵 + 键盘索引。
-> 设置方法：在 `/settings` 中将 TUI mode 改为 `fullscreen`，或启动时加 `--tui-mode fullscreen`。
+> 两种模式均支持完整鼠标交互（v7+）。regular 模式通过"强制视口切片渲染"实现滚动/跳转。
+> 切换模式：在 `/settings` 中修改 TUI mode，或启动时加 `--tui-mode fullscreen|regular`。
 
 ---
 
 ## ✨ 功能
 
-### Fullscreen 模式（完整功能）
+### 功能总览（两种模式一致）
 
 | 功能 | 说明 |
 |------|------|
@@ -45,19 +45,9 @@
 | **鼠标悬停** | 悬停的点**变大高亮**（`⬤` + 反色），编辑器上方实时显示内容预览 |
 | **点击跳转** | 左键点击点 → 对话区**直接滚动跳转**到那条消息 |
 | **滚轮翻点** | 对话超过 18 次时，在点列上滚轮即可**上下滑动翻看**所有点 |
+| **滚轮滚对话** | regular 模式在点列区域外滚动滚轮 = 上下滚动对话区 |
 | **键盘索引** | `Ctrl+Alt+M` / `/marks`：可搜索的对话索引，`↑↓` 选择、`Enter` 跳转 |
 | **发送即回底** | 发送消息后自动回到底部跟随输出 |
-
-### Regular 模式（精简功能）
-
-| 功能 | 说明 |
-|------|------|
-| **右侧点列** | 每个点 = 一次发送，最新在底部；最多 18 个点 |
-| **键盘索引** | `Ctrl+Alt+M` / `/marks`：可搜索的对话索引 |
-| 鼠标悬停 | ❌ 不可用 |
-| 点击跳转 | ❌ 不可用（见下文"架构限制"） |
-| 滚轮翻点 | ❌ 不可用 |
-| 视口联动 | ❌ 不可用 |
 
 ---
 
@@ -82,12 +72,13 @@ cp chat-marks.ts ~/.pi/agent/extensions/
 
 ---
 
-## 🖱️ 使用指南（Fullscreen 模式）
+## 🖱️ 使用指南
 
 ```
 鼠标悬停点    → 点变大 + 内容预览（编辑器上方）
 左键点击点    → 跳转到该次发送
 点列上滚轮    → 上下翻看点（对话超过 18 次时）
+对话区滚轮    → 上下滚动对话（regular 模式由扩展控制）
 Ctrl+Alt+M   → 打开对话索引（键盘路径，可搜索）
 /marks        → 同上
 ```
@@ -104,9 +95,9 @@ Ctrl+Alt+M   → 打开对话索引（键盘路径，可搜索）
 
 ---
 
-## 🏗️ 为什么 Regular 模式功能有限？
+## 🏗️ 两种模式的实现差异
 
-这是 pi TUI **架构层面的限制**，不是 bug，无法绕过。
+两种模式都提供完整功能，但底层机制不同：
 
 ### Fullscreen 模式 (`TuiAltScreen`)
 
@@ -120,33 +111,34 @@ Ctrl+Alt+M   → 打开对话索引（键盘路径，可搜索）
 └─────────────────────────────┘
    pi 控制 ScrollView.scrollTo()
    SGR 鼠标事件由 pi 自己处理
-   → 点击跳转 ✓ 悬停 ✓ 滚轮 ✓
 ```
 
-### Regular 模式 (`TuiMainScreen`)
+### Regular 模式 (`TuiMainScreen`) — v7 方案
 
 ```
 终端主屏幕
-├── 内容行 1      ← 全部写入终端缓冲区
-├── 内容行 2
+├── 内容行 1      ← 全部内容写入终端缓冲区，视图由终端管理
 ├── ...
-├── 内容行 50     ← 超过终端高度时，终端自行管理 scrollback
-├── 内容行 51
-└── 内容行 52     ← 点阵在这里（内容相对），随内容滚动消失
-                    终端 scrollback 由终端管理，pi 无法控制
-                    → 点击跳转 ✗ 悬停 ✗ 滚轮 ✗
+└── 内容行 N
+   ↑ 扩展通过补丁控制视图：清屏后只重绘 [top, top+height) 切片
+     即"强制视口切片渲染"，同步 previousViewportTop 记账
 ```
 
 **关键差异：**
 
 | | fullscreen | regular |
 |---|-----------|---------|
-| 渲染范围 | 只渲染视口大小的内容 | 渲染全部内容写入终端 |
-| overlay 定位 | 屏幕相对（始终可见） | 内容相对（随内容滚动消失） |
-| 滚动控制 | pi 通过 `ScrollView.scrollTo()` 精确控制 | 终端自行管理 scrollback，pi 无法控制 |
-| SGR 鼠标 | pi 处理所有事件，不影响滚动 | 启用后**破坏**终端原生滚动 |
+| 渲染范围 | 只渲染视口大小 | 渲染全部内容写入终端 |
+| 滚动控制 | `ScrollView.scrollTo()` | 扩展强制切片渲染（清屏 + 重绘视口切片） |
+| 点列位置 | 屏幕相对 | 屏幕相对（补丁把点列合成到切片上） |
+| 鼠标 | pi 自己处理 | 扩展开启终端鼠标追踪（SGR 1000/1003/1006）+ inputListener |
 
-简单来说：**fullscreen 模式是 pi 自己画了一个"画中画"窗口，可以精确控制滚动；regular 模式是直接往终端写文本，滚动由终端管理，pi 管不了。**
+**v5 失败教训**：regular 模式曾尝试用 DECSCROLL 命令（`CSI S/T`）滚动，但 Windows Terminal 的 `CSI S/T` 不与 scrollback 交互，且 pi 的渲染记账（`previousViewportTop`）假设视图永远在底部——直接写终端命令导致记账失同步、黑屏。**v7 方案**：滚动/跳转 = 通过补丁让 pi 自己"清屏 + 只重绘目标切片"，并同步 `previousViewportTop`/`hardwareCursorRow` 记账；再通过 tui.js 渲染完成钩子检测视图被 pi 移回底部的情况（追加新消息），自动恢复跟随并让点列在底部重新合成。
+
+**已知差异（v7）**：
+- regular 模式开启鼠标追踪后，**终端原生文本拖选**（按住左键选字）不可用（鼠标事件被应用接管；fullscreen 有 pi 自己的选择实现，regular 暂无）。需要原生行为的场景可设 `CHAT_MARKS_NO_REGULAR_MOUSE=1` 关闭鼠标追踪（恢复终端原生滚动/选择，代价是点列鼠标交互不可用，仅剩键盘索引）。
+- regular 模式滚动中，终端滚动条拖动后扩展的视口记账可能短暂失准（再次滚轮向下会回到真实底部自愈）。
+- regular 模式的滚轮滚动是"清屏重绘切片"，长会话下比原生 scrollback 略费资源，但视觉一致。
 
 ---
 
@@ -162,8 +154,12 @@ chat-marks.ts
 │   ├── 滚动钩子（scroll-view.js 补丁注入）
 │   ├── 视口指示（ScrollView.scrollTop 精确同步）
 │   └── 点击跳转（ScrollView.scrollTo 精确跳转）
-├── createRegularHandler() → 点阵 + 键盘
-│   └── 无鼠标交互、无视口指示、无跳转
+├── createRegularHandler() → 完整鼠标交互（v7）
+│   ├── 终端鼠标追踪（SGR 1000/1003/1006 + inputListener）
+│   ├── 强制切片渲染（tui-main-screen.js 补丁：跳转/滚动）
+│   ├── 渲染完成钩子（tui.js 补丁：视口 reconcile + 指示更新）
+│   ├── 视口指示（previousViewportTop + previousLines 计算）
+│   └── 点击跳转（强制视口切片，视图居中）
 └── 入口（模式检测 → 路由到对应 handler）
 ```
 
@@ -171,10 +167,14 @@ chat-marks.ts
 
 | 补丁 | 文件 | 作用 |
 |------|------|------|
-| 鼠标钩子 | `tui-alt-screen.js` | 在 pi 处理鼠标前拦截点列区域的事件 |
+| 鼠标钩子 | `tui-alt-screen.js` | 在 pi 处理鼠标前拦截点列区域的事件（fullscreen） |
 | 滚动条守卫 | `tui-alt-screen.js` | 非捕获 overlay 不再禁用滚动条点击/拖动 |
 | 选择守卫 | `tui-alt-screen.js` | 非捕获 overlay 不再禁用文本拖选复制 |
 | 滚动钩子 | `scroll-view.js`（×2） | 所有滚动通知扩展，驱动视口指示点 |
+| 渲染钩子 | `tui.js`（×2） | 每次渲染完成后通知扩展（打在 doRender 调用点——regular 渲染不经过 renderNow） |
+| 视口合成 | `tui.js` | 滚动状态下点列按持久视口位置合成（屏幕固定） |
+| 合成跳过 | `tui-main-screen.js` | 强制切片渲染时跳过内容底部合成 |
+| 强制切片 | `tui-main-screen.js` | 清屏后只重绘 [top, top+height) 切片并同步记账 |
 
 补丁全部**幂等**（检测到已打则跳过）；pi 升级覆盖文件后，扩展下次加载时**自动重新打补丁**。
 
@@ -202,7 +202,9 @@ chat-marks.ts
 ## ❓ 常见问题（FAQ）
 
 **Q：为什么鼠标悬停/点击/滚轮不工作？**
-请确认使用 **fullscreen 模式**（在 `/settings` 中设置 TUI mode 为 `fullscreen`，或启动时加 `--tui-mode fullscreen`）。regular 模式下这些功能不可用（见上文"架构限制"）。
+1. 确认已**重启** pi（补丁在进程启动时加载，`/reload` 不会重载 TUI 组件）
+2. 确认扩展加载无 ⚠️ 补丁警告（pi 版本过旧时锚点可能不匹配，键盘路径 `Ctrl+Alt+M` 始终可用）
+3. regular 模式可设 `CHAT_MARKS_DEBUG=1` 后查看 `%TEMP%\chat-marks-regular.log` 调试日志
 
 **Q：装了之后滚动条/拖选复制失效了？**
 旧版本的 bug（overlay 误禁用滚动条/选择），已通过"滚动条守卫/选择守卫"补丁修复。请确认使用的是最新版本并已重启。
@@ -219,7 +221,9 @@ chat-marks.ts
 避免右侧视觉噪点。超过 18 次对话后，在点列上滚动滚轮即可翻看所有点。
 
 **Q：会不会影响打字/选择/滚动？**
-不会。点列是 `nonCapturing` overlay（不抢键盘焦点）；点列区域外的鼠标事件原样放行。
+打字不受影响：点列是 `nonCapturing` overlay（不抢键盘焦点），鼠标事件在输入分发前由扩展消费。
+选择：fullscreen 模式文本拖选正常（选择守卫补丁）；regular 模式开启鼠标追踪后**终端原生拖选不可用**（与 fullscreen 一致——fullscreen 的选择由 pi 自己实现；regular 暂无选择实现）。可用 `CHAT_MARKS_NO_REGULAR_MOUSE=1` 恢复原生行为（代价是点列鼠标交互不可用）。
+滚动：fullscreen 由 pi 的 ScrollView 处理；regular 由扩展的强制切片渲染处理（点列区域外滚轮 = 滚动对话区）。
 
 **Q：扩展修改了 pi 的安装文件，安全吗？**
 补丁是**幂等、可恢复**的：只插入几行钩子调用，pi 升级覆盖文件后扩展会自动重新打补丁。不想要了：删除扩展文件即可。
@@ -240,6 +244,7 @@ LICENSE          # MIT License
 
 | 版本 | 内容 |
 |------|------|
+| v7 | **regular 模式功能对齐 fullscreen**：终端鼠标追踪（SGR 1000/1003/1006 + inputListener）+ 强制视口切片渲染（tui-main-screen.js/tui.js 补丁，修复 v5 DECSCROLL 黑屏根因）。悬停预览/点击跳转/滚轮滚动对话/视口联动/键盘索引全部可用 |
 | v6 | **路由架构重构**：`createFullscreenHandler` + `createRegularHandler` 模式路由；regular 模式精简为点阵+键盘；明确文档两种模式的架构限制 |
 | v5 | 双模式尝试（受限于架构，regular 模式鼠标交互无法可靠工作） |
 | v4 | 点击点改为滚动对话区跳转（不再弹窗展示） |
