@@ -390,6 +390,17 @@ export default function (pi: ExtensionAPI) {
     const execDir = dirname(process.execPath);
     candidates.push(join(execDir, "node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"));
     candidates.push(join(process.cwd(), "node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"));
+    // 全局 npm 安装位置（npm root -g 的常见路径）
+    try {
+      const { execSync } = require("node:child_process") as typeof import("node:child_process");
+      const root = execSync("npm root -g", { encoding: "utf8", windowsHide: true, timeout: 5000 }).trim();
+      if (root) {
+        candidates.push(join(root, "@earendil-works/pi-tui/dist/tui-alt-screen.js"));
+        candidates.push(join(root, "@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js"));
+      }
+    } catch {
+      // 无 npm 或执行失败，忽略
+    }
     for (const c of candidates) {
       if (existsSync(c)) return c;
     }
@@ -415,6 +426,9 @@ export default function (pi: ExtensionAPI) {
     const src = readFileSync(file, "utf8");
     if (src.includes(mark)) return; // 已打过补丁
     if (!src.includes(anchor)) {
+      if (!patchProblem) {
+        patchProblem = `pi 版本与扩展不兼容（补丁点 ${label} 未找到）。请更新 pi-chat-marks 扩展，或提 Issue 适配新版本；键盘路径 Ctrl+Alt+M 仍可用`;
+      }
       warn(`[chat-marks] tui-alt-screen.js 版本不匹配，无法打补丁（${label}）`);
       return;
     }
@@ -423,11 +437,14 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** 幂等补丁：插入鼠标钩子调用点、滚动钩子调用点，并放开非捕获 overlay 对滚动条/选择的禁用。 */
+  let patchProblem: string | undefined; // 补丁问题描述（用于启动时提示用户）
+
   function ensureAltScreenPatches(): void {
     try {
       const file = findTuiAltScreenPath();
       if (!file) {
-        warn("[chat-marks] 未找到 tui-alt-screen.js，鼠标交互不可用（键盘路径 Ctrl+Alt+M 仍可用）");
+        patchProblem = "未找到 pi 的 TUI 组件文件（tui-alt-screen.js），鼠标交互不可用；键盘路径 Ctrl+Alt+M 仍可用";
+        warn("[chat-marks] " + patchProblem);
       } else {
         applyIdempotentPatch(file, PATCH_MARK, PATCH_ANCHOR, PATCH_INSERT, "鼠标钩子");
         applyIdempotentPatch(file, PATCH2_MARK, PATCH2_ANCHOR, PATCH2_INSERT, "滚动条守卫");
@@ -435,13 +452,17 @@ export default function (pi: ExtensionAPI) {
       }
       const scrollFile = findScrollViewPath();
       if (!scrollFile) {
+        if (!patchProblem) {
+          patchProblem = "未找到 pi 的滚动组件（scroll-view.js），视口位置指示不可用；鼠标点击/悬停仍可用";
+        }
         warn("[chat-marks] 未找到 scroll-view.js，视口位置指示不可用");
       } else {
         applyIdempotentPatch(scrollFile, PATCH4_MARK, PATCH4_ANCHOR, PATCH4_INSERT, "滚动钩子 scrollTo");
         applyIdempotentPatch(scrollFile, PATCH5_MARK, PATCH5_ANCHOR, PATCH5_INSERT, "滚动钩子 scrollBy");
       }
     } catch (err) {
-      warn("[chat-marks] 打补丁失败:", err instanceof Error ? err.message : String(err));
+      patchProblem = "打补丁失败：" + (err instanceof Error ? err.message : String(err));
+      warn("[chat-marks] " + patchProblem);
     }
   }
 
@@ -622,6 +643,9 @@ export default function (pi: ExtensionAPI) {
   // ---- 事件 ----
 
   pi.on("session_start", async (_event, ctx) => {
+    if (patchProblem && ctx.hasUI && ctx.mode === "tui") {
+      ctx.ui.notify("[chat-marks] ⚠️ " + patchProblem, "warning");
+    }
     messages = [];
     selectedIndex = -1;
     hoverIndex = -1;
