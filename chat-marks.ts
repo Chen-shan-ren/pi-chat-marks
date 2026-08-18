@@ -250,6 +250,49 @@ const PATCH7_INSERT =
   "            ? globalThis.__piViewportTop\n" +
   "            : Math.max(0, workingHeight - termHeight);";
 
+// 点列行透明合成标记(APC 序列,终端忽略;PATCH10 在合成时消费)。
+// 带标记的 overlay 行合成时不重置 SGR → 继承内容行背景,点列融入内容(无黑边)。
+const TRANSPARENT_MARK = "\x1b_cm\x07";
+
+// PATCH10 打在 tui.js compositeTuiLine:支持透明合成(仅点列行带标记,其它 overlay 不受影响)
+const PATCH10_MARK = "__piTransparentOverlay";
+const PATCH10_ANCHOR =
+  "    const overlay = sliceWithWidth(overlayLine, 0, overlayWidth, true);\n" +
+  "    const beforePad = Math.max(0, startCol - base.beforeWidth);\n" +
+  "    const overlayPad = Math.max(0, overlayWidth - overlay.width);\n" +
+  "    const actualBeforeWidth = Math.max(startCol, base.beforeWidth);\n" +
+  "    const actualOverlayWidth = Math.max(overlayWidth, overlay.width);\n" +
+  "    const afterTarget = Math.max(0, totalWidth - actualBeforeWidth - actualOverlayWidth);\n" +
+  "    const afterPad = Math.max(0, afterTarget - base.afterWidth);\n" +
+  "    const result = base.before +\n" +
+  "        \" \".repeat(beforePad) +\n" +
+  "        SEGMENT_RESET +\n" +
+  "        overlay.text +\n" +
+  "        \" \".repeat(overlayPad) +\n" +
+  "        SEGMENT_RESET +\n" +
+  "        base.after +\n" +
+  "        \" \".repeat(afterPad);";
+const PATCH10_INSERT =
+  "    const overlay = sliceWithWidth(overlayLine, 0, overlayWidth, true);\n" +
+  "    // [chat-marks-patch] __piTransparentOverlay: 行首 APC \\x1b_cm\\x07 = 透明合成(继承内容背景,不重置 SGR)\n" +
+  "    const __piTransparentOverlay = overlay.text.startsWith(\"\\x1b_cm\\x07\");\n" +
+  "    if (__piTransparentOverlay)\n" +
+  "        overlay.text = overlay.text.slice(5);\n" +
+  "    const beforePad = Math.max(0, startCol - base.beforeWidth);\n" +
+  "    const overlayPad = Math.max(0, overlayWidth - overlay.width);\n" +
+  "    const actualBeforeWidth = Math.max(startCol, base.beforeWidth);\n" +
+  "    const actualOverlayWidth = Math.max(overlayWidth, overlay.width);\n" +
+  "    const afterTarget = Math.max(0, totalWidth - actualBeforeWidth - actualOverlayWidth);\n" +
+  "    const afterPad = Math.max(0, afterTarget - base.afterWidth);\n" +
+  "    const result = base.before +\n" +
+  "        \" \".repeat(beforePad) +\n" +
+  "        (__piTransparentOverlay ? \"\" : SEGMENT_RESET) +\n" +
+  "        overlay.text +\n" +
+  "        \" \".repeat(overlayPad) +\n" +
+  "        (__piTransparentOverlay ? \"\" : SEGMENT_RESET) +\n" +
+  "        base.after +\n" +
+  "        \" \".repeat(afterPad);";
+
 // PATCH8/9 打在 tui-main-screen.js（regular 模式渲染器）
 const PATCH8_MARK = "__piCompositeSkip";
 const PATCH8_ANCHOR =
@@ -399,6 +442,7 @@ function applyPatches(log: (msg: string) => void, warn: (msg: string) => void): 
     applyIdempotentPatch(tuiJs, PATCH6A_MARK, PATCH6A_ANCHOR, PATCH6A_INSERT, "渲染钩子 immediate", warn);
     applyIdempotentPatch(tuiJs, PATCH6B_MARK, PATCH6B_ANCHOR, PATCH6B_INSERT, "渲染钩子 throttled", warn);
     applyIdempotentPatch(tuiJs, PATCH7_MARK, PATCH7_ANCHOR, PATCH7_INSERT, "视口合成", warn);
+    applyIdempotentPatch(tuiJs, PATCH10_MARK, PATCH10_ANCHOR, PATCH10_INSERT, "透明合成", warn);
   }
   const mainScreen = findTuiMainScreenPath();
   if (!mainScreen) {
@@ -661,6 +705,10 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
   let mouseEnabled = false;
   let mouseCleanup: (() => void) | undefined;
   let rowMapCache: { lines: string[]; map: Map<number, number> } | undefined;
+  // 终端滚动条交互（拖动/点击）后视图位置未知：隐藏 ◉ 指示，直到下次扩展控制的滚动/跳转
+  let scrollbarUnknown = false;
+  // 滚动条拖动跟踪：按下点 + 按下时视图顶行（释放时按拇指位移近似对齐）
+  let scrollbarDrag: { startY: number; startTop: number } | undefined;
 
   const dbg = (msg: string) => {
     if (process.env.CHAT_MARKS_DEBUG !== "1") return;
@@ -699,7 +747,9 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
 
   function inDotsRegion(x: number, y: number): boolean {
     const { columns, rows } = termSize();
-    if (x < columns - 2 || x > columns - 1) return false;
+    // regular 模式没有 pi 的滚动条占位：点列实际渲染在 1-based 列 [columns-1, columns]
+    // （fullscreen 有点列左侧的滚动条占位，判定区域是 [columns-2, columns-1]，两者不同）
+    if (x < columns - 1 || x > columns) return false;
     const count = dotsCount();
     if (count === 0) return false;
     const top = dotsTopRow();
@@ -726,7 +776,8 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       } else {
         dot = theme.fg("muted", "•");
       }
-      rows.push(width > 1 ? " " + dot : dot);
+      // TRANSPARENT_MARK：合成时不重置 SGR，点列继承内容行背景（无黑边）
+      rows.push(TRANSPARENT_MARK + (width > 1 ? " " + dot : dot));
     }
     return rows;
   }
@@ -761,6 +812,8 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     dbg(`setViewport top=${target} (was ${currentViewportTop()}, content=${contentLen}, rows=${rows})`);
     g["__piForcedViewportTop"] = target;
     g["__piViewportTop"] = target;
+    scrollbarUnknown = false;
+    scrollbarDrag = undefined;
     t.requestRender?.(true);
   }
 
@@ -830,6 +883,8 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       dbg(`viewport reconciled to pi bookkeeping: ${pvt} (was forced ${forced})`);
       // 视图已回到底部：立即重渲染一次，让点列在底部重新合成
       tui.requestRender?.();
+      // 视图回到底部后恢复悬停预览 widget
+      if (hoverIndex >= 0) updateHoverPreview();
     }
     const top = currentViewportTop();
     const rows = termSize().rows;
@@ -883,7 +938,20 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     dbg("mouse tracking disabled");
   }
 
+  /** 视图是否在底部（跟随状态）：仅此时允许更新悬停预览 widget */
+  function isViewportAtBottom(): boolean {
+    const t = dotsTui;
+    if (!t) return true;
+    const rows = termSize().rows;
+    const contentLen = t.previousLines?.length ?? 0;
+    const maxTop = Math.max(0, contentLen - rows);
+    return currentViewportTop() >= maxTop;
+  }
+
   function updateHoverPreview() {
+    // 视图非底部（扩展强制视口）时：更新 widget 会触发内容底部（widget 所在行）渲染，
+    // pi 的差分渲染会把视图 snap 回底部 —— 因此滚动状态下只保留点列高亮，不更新 widget。
+    if (!isViewportAtBottom()) return;
     if (hoverIndex >= 0 && hoverIndex < messages.length) {
       const m = messages[hoverIndex];
       ctx.ui.setWidget("chat-marks-preview", [
@@ -903,6 +971,41 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     const isMove = mouse.button >= 32 && mouse.button < 64;
     const isWheel = mouse.button >= 64;
     dbg(`mouse btn=${mouse.button} x=${mouse.x} y=${mouse.y} ${mouse.press ? "press" : "release"}`);
+
+    // 终端滚动条交互：按下（最右列、点列区域外）= 拖动开始。拖动期间视图由终端滚动，
+    // 扩展无法实时感知，且任何渲染都会把视图 snap 回记账位置 —— 因此拖动期间不渲染、
+    // 只消费事件；释放时按拇指位移近似公式一次对齐视图（并更新 ◉）。
+    if (btn === 0 && mouse.press && mouse.x === termSize().columns && !inDotsRegion(mouse.x, mouse.y)) {
+      scrollbarUnknown = true;
+      scrollbarDrag = { startY: mouse.y, startTop: currentViewportTop() };
+      viewportIndex = -1;
+      dotsTui?.requestRender?.();
+      dbg(`scrollbar drag start y=${mouse.y} startTop=${scrollbarDrag.startTop}`);
+      return { consume: true };
+    }
+    if (scrollbarDrag) {
+      // 拖动中：只消费，不渲染
+      if (btn === 0 && !mouse.press) {
+        // 释放：拇指位移 × (内容行数/可视行数) ≈ 滚动量，一次对齐（Δy≈0 = 纯点击，保持隐藏）
+        const t = dotsTui;
+        if (t) {
+          const rows = termSize().rows;
+          const contentLen = t.previousLines?.length ?? 0;
+          const dy = mouse.y - scrollbarDrag.startY;
+          if (Math.abs(dy) >= 1 && rows > 0 && contentLen > rows) {
+            const ratio = contentLen / rows;
+            // 鼠标上移(dy<0)= 看更旧内容 = 顶行减小;下移反之
+            const finalTop = Math.max(0, Math.min(scrollbarDrag.startTop + dy * ratio, contentLen - rows));
+            dbg(`scrollbar drag end dy=${dy} ratio=${ratio.toFixed(2)} top=${finalTop.toFixed(0)}`);
+            setViewport(Math.round(finalTop));
+          } else {
+            dbg("scrollbar click (no drag), viewport stays unknown");
+          }
+        }
+        scrollbarDrag = undefined;
+      }
+      return { consume: true };
+    }
 
     if (!inDotsRegion(mouse.x, mouse.y)) {
       // 点列区域外
