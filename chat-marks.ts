@@ -402,12 +402,15 @@ const PATCH11_INSERT =
   "                return false;\n" +
   "        }\n" +
   "        // [chat-marks-patch] 选择器(/settings 等)渲染在 editorContainer 而非 overlayStack:\n" +
-  "        // 切换 TUI 前必须先恢复编辑器,否则选择器组件随 children 复制到新 TUI 导致崩溃/残留\n" +
+  "        // 切换 TUI 前必须先恢复编辑器,否则选择器组件随 children 复制到新 TUI 导致崩溃/残留;\n" +
+  "        // 同时把焦点还给编辑器——否则下方 getFocusedComponent() 返回已被移除的选择器,\n" +
+  "        // 新 TUI setFocus(无效组件)后键盘输入无接收者(输入框打不了字)\n" +
   "        if (globalThis.__piSelectorActive) {\n" +
   "            globalThis.__piSelectorActive = false;\n" +
   "            try {\n" +
   "                this.editorContainer?.clear?.();\n" +
   "                this.editorContainer?.addChild?.(this.editor);\n" +
+  "                previousUi.setFocus?.(this.editor);\n" +
   "            }\n" +
   "            catch { /* 恢复编辑器失败不阻塞切换 */ }\n" +
   "        }\n" +
