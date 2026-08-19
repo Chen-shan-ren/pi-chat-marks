@@ -1463,7 +1463,7 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
                 // 首行用 accent(高亮),次行用 description(次要)
                 return lines.map((l, i) => i === 0
                   ? theme2.fg("accent", l)
-                  : theme2.description(l));
+                  : theme2.fg("muted", l));
               },
               invalidate: () => {},
               handleInput: () => {},
