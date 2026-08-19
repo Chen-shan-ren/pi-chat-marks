@@ -365,121 +365,6 @@ const PATCH9_INSERT =
   "            }\n" +
   "            for (let i = 0; i < newLines.length; i++) {";
 
-// ===========================================================================
-// interactive-mode.js 补丁(/settings 切换 TUI mode 支持;pi 更新后由 applyPatches 自动重打)
-// ===========================================================================
-// 背景:pi 的 switchTuiMode 检查 hasOverlayEntries,chat-marks 的常驻 overlay 会阻止切换;
-// 设置选择器渲染在 editorContainer(不在 overlayStack),切换 TUI 前需先恢复编辑器;
-// 切换完成后通知扩展重建常驻 overlay。锚点基于 pi 0.84.2,版本升级不匹配时仅告警。
-
-const PATCH11_MARK = "__piTuiModeSwitch";
-const PATCH11_ANCHOR =
-  "    switchTuiMode(mode, restoreProgress = true, startRenderer = true) {\n" +
-  "        const previousUi = this.renderer;\n" +
-  "        if (mode === previousUi.mode)\n" +
-  "            return true;\n" +
-  "        if (previousUi.hasOverlayEntries)\n" +
-  "            return false;\n" +
-  "        const components = [...previousUi.children];";
-const PATCH11_INSERT =
-  "    switchTuiMode(mode, restoreProgress = true, startRenderer = true) {\n" +
-  "        const previousUi = this.renderer;\n" +
-  "        if (mode === previousUi.mode)\n" +
-  "            return true;\n" +
-  "        // [chat-marks-patch] __piTuiModeSwitch: 常驻 overlay(chat-marks 点列/预览/flash,带\n" +
-  "        // __cmPersistent 标记)不应阻止 TUI mode 切换;捕获型 overlay(设置选择器等)自动关闭后再切换\n" +
-  "        {\n" +
-  "            const __cmStack = previousUi.overlayStack ?? [];\n" +
-  "            while (__cmStack.length > 0 && __cmStack.some((e) => !e.options?.__cmPersistent)) {\n" +
-  "                const __top = __cmStack[__cmStack.length - 1];\n" +
-  "                if (__top.options?.__cmPersistent)\n" +
-  "                    break;\n" +
-  "                previousUi.hideOverlay();\n" +
-  "                if (__cmStack.length === previousUi.overlayStack.length)\n" +
-  "                    break; // hideOverlay 未生效,防死循环\n" +
-  "            }\n" +
-  "            if (__cmStack.some((e) => !e.options?.__cmPersistent))\n" +
-  "                return false;\n" +
-  "        }\n" +
-  "        // [chat-marks-patch] 选择器(/settings 等)渲染在 editorContainer 而非 overlayStack:\n" +
-  "        // 切换 TUI 前必须先恢复编辑器,否则选择器组件随 children 复制到新 TUI 导致崩溃/残留\n" +
-  "        if (globalThis.__piSelectorActive) {\n" +
-  "            globalThis.__piSelectorActive = false;\n" +
-  "            try {\n" +
-  "                this.editorContainer?.clear?.();\n" +
-  "                this.editorContainer?.addChild?.(this.editor);\n" +
-  "            }\n" +
-  "            catch { /* 恢复编辑器失败不阻塞切换 */ }\n" +
-  "        }\n" +
-  "        const components = [...previousUi.children];";
-
-// 注意:mark 用中文注释文本做幂等检测(手动补丁与自动补丁共用同一注释)
-const PATCH12A_MARK = "选择器已关闭";
-const PATCH12A_ANCHOR =
-  "            this.editorContainer.clear();\n" +
-  "            this.editorContainer.addChild(this.editor);\n" +
-  "            this.ui.setFocus(this.editor);\n" +
-  "        };";
-const PATCH12A_INSERT =
-  "            this.editorContainer.clear();\n" +
-  "            this.editorContainer.addChild(this.editor);\n" +
-  "            this.ui.setFocus(this.editor);\n" +
-  "            // [chat-marks-patch] 选择器已关闭\n" +
-  "            globalThis.__piSelectorActive = false;\n" +
-  "        };";
-const PATCH12B_MARK = "选择器已打开";
-const PATCH12B_ANCHOR =
-  "        this.editorContainer.clear();\n" +
-  "        this.editorContainer.addChild(created.component);\n" +
-  "        this.ui.setFocus(created.focus);\n" +
-  "        this.ui.requestRender();\n" +
-  "    }";
-const PATCH12B_INSERT =
-  "        this.editorContainer.clear();\n" +
-  "        this.editorContainer.addChild(created.component);\n" +
-  "        this.ui.setFocus(created.focus);\n" +
-  "        this.ui.requestRender();\n" +
-  "        // [chat-marks-patch] 选择器已打开\n" +
-  "        globalThis.__piSelectorActive = true;\n" +
-  "    }";
-
-const PATCH13_MARK = "__piAfterTuiSwitch";
-const PATCH13_ANCHOR =
-  "        nextUi.start();\n" +
-  "        this.themeController.rebindTui();\n" +
-  "        this.rebindExtensionTerminalInputListeners();\n" +
-  "        if (restoreProgress &&";
-const PATCH13_INSERT =
-  "        nextUi.start();\n" +
-  "        this.themeController.rebindTui();\n" +
-  "        this.rebindExtensionTerminalInputListeners();\n" +
-  "        // [chat-marks-patch] TUI 切换完成:通知扩展重建常驻 overlay(点列/预览/flash)\n" +
-  "        globalThis.__piAfterTuiSwitch?.(nextUi);\n" +
-  "        if (restoreProgress &&";
-
-function findInteractiveModePath(): string | undefined {
-  const candidates: string[] = [];
-  try {
-    const req = (globalThis as { require?: NodeRequire }).require ?? require;
-    const pkgEntry = req.resolve("@earendil-works/pi-coding-agent");
-    candidates.push(join(dirname(dirname(pkgEntry)), "dist/modes/interactive/interactive-mode.js"));
-  } catch { /* */ }
-  const execDir = dirname(process.execPath);
-  candidates.push(join(execDir, "node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js"));
-  candidates.push(join(process.cwd(), "node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js"));
-  try {
-    const { execSync } = require("node:child_process") as typeof import("node:child_process");
-    const root = execSync("npm root -g", { encoding: "utf8", windowsHide: true, timeout: 5000 }).trim();
-    if (root) {
-      candidates.push(join(root, "@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js"));
-    }
-  } catch { /* */ }
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  return undefined;
-}
-
 function findTuiAltScreenPath(): string | undefined {
   const candidates: string[] = [];
   try {
@@ -573,17 +458,6 @@ function applyPatches(log: (msg: string) => void, warn: (msg: string) => void): 
     applyIdempotentPatch(mainScreen, PATCH8_MARK, PATCH8_ANCHOR, PATCH8_INSERT, "合成跳过", warn);
     applyIdempotentPatch(mainScreen, PATCH9_MARK, PATCH9_ANCHOR, PATCH9_INSERT, "强制切片", warn);
   }
-  // interactive-mode.js(/settings 切换 TUI mode;pi 更新后自动重打)
-  const interactiveMode = findInteractiveModePath();
-  if (!interactiveMode) {
-    if (!problem) problem = "未找到 interactive-mode.js，/settings 切换 TUI mode 不可用";
-    warn("[chat-marks] 未找到 interactive-mode.js");
-  } else {
-    applyIdempotentPatch(interactiveMode, PATCH11_MARK, PATCH11_ANCHOR, PATCH11_INSERT, "TUI 切换放行", warn);
-    applyIdempotentPatch(interactiveMode, PATCH12A_MARK, PATCH12A_ANCHOR, PATCH12A_INSERT, "选择器状态标记(关闭)", warn);
-    applyIdempotentPatch(interactiveMode, PATCH12B_MARK, PATCH12B_ANCHOR, PATCH12B_INSERT, "选择器状态标记(打开)", warn);
-    applyIdempotentPatch(interactiveMode, PATCH13_MARK, PATCH13_ANCHOR, PATCH13_INSERT, "TUI 切换完成通知", warn);
-  }
   return problem;
 }
 
@@ -654,8 +528,7 @@ function createFullscreenHandler(messages: UserMsg[], ctx: ExtensionContext) {
       } else {
         dot = theme.fg("muted", "•");
       }
-      // TRANSPARENT_MARK：合成时不重置 SGR，点列继承内容行背景（无黑边）
-      rows.push(TRANSPARENT_MARK + (width > 1 ? " " + dot : dot));
+      rows.push(width > 1 ? " " + dot : dot);
     }
     return rows;
   }
@@ -841,17 +714,9 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
   // 跳转钉住的指示索引：jumpToMessage 设置，渲染完成后由 updateViewportIndicator 消费一次。
   // 视口顶行被 clamp（消息太靠底无法居中）时，中线扫描会指到上一条消息，钉住保证 ◉ 指目标。
   let pinnedViewportIndex = -1;
-  // 悬停预览（overlay 内容：屏幕底部显示，与 fullscreen 的 widget 同位置；底部/非底部统一）
+  // 非底部悬停预览（overlay tooltip 内容；底部用 widget，两者互斥）
   let previewLines: string[] | undefined;
   let previewOverlayCreated = false;
-  // 跳转 flash（屏幕右上角，与 fullscreen 一致）
-  let flashLines: string[] | undefined;
-  let flashOverlayCreated = false;
-  let flashTimer: ReturnType<typeof setTimeout> | undefined;
-  // 内容区文字选择（左键按下拖动；释放时提取文本 + OSC52 复制）
-  let selecting = false;
-  let selAnchor: { row: number; col: number } | undefined;
-  let selCurrent: { row: number; col: number } | undefined;
   // 终端滚动条交互（拖动/点击）后视图位置未知：隐藏 ◉ 指示，直到下次扩展控制的滚动/跳转
   let scrollbarUnknown = false;
   // 滚动条拖动跟踪：按下点 + 按下时视图顶行（释放时按拇指位移近似对齐）
@@ -1012,7 +877,7 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       pinnedViewportIndex = index;
       setViewport(top);
     }
-    showFlash(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`);
+    ctx.ui.notify(`已跳转到第 ${index + 1}/${messages.length} 次发送 · ${fmtTime(target.timestamp)}`, "info");
     return true;
   }
 
@@ -1046,7 +911,6 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     if (typeof forced === "number" && pvt !== forced) {
       g["__piViewportTop"] = undefined;
       pinnedViewportIndex = -1;
-      cancelSelection();
       dbg(`viewport reconciled to pi bookkeeping: ${pvt} (was forced ${forced})`);
       // 视图已回到底部：立即重渲染一次，让点列在底部重新合成
       tui.requestRender?.();
@@ -1082,8 +946,6 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       tui.requestRender?.();
       syncWindowToViewport();
     }
-    // 选择高亮：渲染完成后重写（渲染会擦掉上次的反色）
-    renderSelection();
   }
 
   // ---- 鼠标追踪 ----
@@ -1126,187 +988,36 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     return currentViewportTop() >= maxTop;
   }
 
-  /** 右上角 flash（regular 无内置 flash，用 overlay 模拟；与 fullscreen 的 flash 视觉一致） */
-  function showFlash(msg: string, ms = 1500): void {
-    flashLines = [msg];
-    if (flashTimer) clearTimeout(flashTimer);
-    flashTimer = setTimeout(() => {
-      flashLines = undefined;
-      dotsTui?.requestRender?.();
-    }, ms);
-    dotsTui?.requestRender?.();
-  }
-
   function updateHoverPreview() {
     const hasHover = hoverIndex >= 0 && hoverIndex < messages.length;
-    dbg(`updateHoverPreview hover=${hoverIndex} bottom=${isViewportAtBottom()} previewLines=${previewLines?.length ?? 0}->${hasHover ? 2 : 0}`);
-    // 统一用屏幕底部 overlay 预览（与 fullscreen 的 widget 同位置）：
-    // widget 在 regular 模式下渲染于内容末尾，更新/清除都会触发差分渲染滚动视口（snap）
-    // 且 2 行↔1 行重排会残留黑行 —— overlay 屏幕定位、行数固定，两者都不存在。
-    if (hasHover) {
-      const m = messages[hoverIndex];
-      previewLines = [
-        `⏱ ${fmtTime(m.timestamp)} · 第 ${hoverIndex + 1} 次发送`,
-        preview(m.text, 60),
-      ];
-    } else {
+    dbg(`updateHoverPreview hover=${hoverIndex} bottom=${isViewportAtBottom()} previewLines=${previewLines?.length ?? 0}->${hasHover ? (isViewportAtBottom() ? 0 : 2) : 0}`);
+    if (isViewportAtBottom()) {
+      // 视图在底部：widget 渲染在内容末尾，差分渲染安全，用 pi 原生 widget 预览
       previewLines = undefined;
-    }
-    dotsTui?.requestRender?.();
-  }
-
-  // ---- 内容区文字选择（左键按下拖动；释放时提取文本 + OSC52 复制） ----
-
-  /** 是否有捕获型 overlay 打开（openMarks 列表等）或选择器打开（/settings 等）：
-   * 有则放行鼠标事件，不拦截选择 */
-  function hasCapturingOverlay(): boolean {
-    const t = dotsTui as (TuiBaseLike & {
-      overlayStack?: Array<{ options?: { nonCapturing?: boolean } }>;
-      isOverlayVisible?: (e: unknown) => boolean;
-    }) | undefined;
-    return (globalThis as Record<string, unknown>)["__piSelectorActive"] === true
-      || !!t?.overlayStack?.some((e) => e.options?.nonCapturing !== true && (t.isOverlayVisible?.(e) ?? true));
-  }
-
-  function isWideChar(ch: string): boolean {
-    const c = ch.codePointAt(0) ?? 0;
-    return (c >= 0x1100 && c <= 0x11ff) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
-      (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) ||
-      (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x20000 && c <= 0x2fffd) || (c >= 0x30000 && c <= 0x3fffd);
-  }
-
-  function visibleWidthOf(s: string): number {
-    let w = 0;
-    for (const ch of s) w += isWideChar(ch) ? 2 : 1;
-    return w;
-  }
-
-  /** 可见列 → 字符索引（宽字符占 2 列，列落在宽字符中间时取该字符起点） */
-  function colToCharIndex(s: string, col: number): number {
-    let w = 0;
-    for (let i = 0; i < s.length; i++) {
-      const cw = isWideChar(s[i]) ? 2 : 1;
-      if (w + cw > col) return i;
-      w += cw;
-    }
-    return s.length;
-  }
-
-  /** 提取 [col1, col2] 可见列区间的文本（按字符边界） */
-  function sliceByVisibleCols(s: string, col1: number, col2: number): string {
-    const i1 = colToCharIndex(s, Math.max(0, col1));
-    const i2 = colToCharIndex(s, Math.max(0, col2 + 1));
-    return s.slice(i1, Math.max(i1, i2));
-  }
-
-  function beginSelection(x: number, y: number): void {
-    const t = dotsTui;
-    if (!t) return;
-    const top = currentViewportTop();
-    const row = y - 1 + top;
-    const col = x - 1;
-    const lines = t.previousLines ?? [];
-    if (row < 0 || row >= lines.length) return;
-    selecting = true;
-    selAnchor = { row, col };
-    selCurrent = { row, col };
-    dbg(`selection begin row=${row} col=${col}`);
-  }
-
-  function updateSelection(x: number, y: number): void {
-    if (!selecting || !selAnchor) return;
-    const t = dotsTui;
-    if (!t) return;
-    const top = currentViewportTop();
-    const row = y - 1 + top;
-    const col = x - 1;
-    const lines = t.previousLines ?? [];
-    if (row < 0 || row >= lines.length) return;
-    selCurrent = { row, col };
-    renderSelection();
-  }
-
-  function cancelSelection(): void {
-    if (!selecting) return;
-    selecting = false;
-    selAnchor = undefined;
-    selCurrent = undefined;
-    dotsTui?.requestRender?.(true);
-  }
-
-  function extractSelection(a: { row: number; col: number }, c: { row: number; col: number }): string {
-    const t = dotsTui;
-    if (!t) return "";
-    const lines = t.previousLines ?? [];
-    const r1 = Math.min(a.row, c.row);
-    const r2 = Math.max(a.row, c.row);
-    const c1 = a.row <= c.row ? a.col : c.col;
-    const c2 = a.row <= c.row ? c.col : a.col;
-    const parts: string[] = [];
-    for (let r = r1; r <= r2; r++) {
-      const line = stripAnsi(lines[r] ?? "").trimEnd();
-      if (r === r1 && r === r2) {
-        parts.push(sliceByVisibleCols(line, c1, c2));
-      } else if (r === r1) {
-        parts.push(sliceByVisibleCols(line, c1, visibleWidthOf(line)));
-      } else if (r === r2) {
-        parts.push(sliceByVisibleCols(line, 0, c2));
+      if (hasHover) {
+        const m = messages[hoverIndex];
+        ctx.ui.setWidget("chat-marks-preview", [
+          `⏱ ${fmtTime(m.timestamp)} · 第 ${hoverIndex + 1} 次发送`,
+          preview(m.text, 60),
+        ]);
       } else {
-        parts.push(line);
+        ctx.ui.setWidget("chat-marks-preview", undefined);
       }
+    } else {
+      // 视图非底部：更新 widget（含 setWidget(undefined)）会触发差分渲染滚动视口
+      // （变化行在内容末尾 = 视口外，pi 用 \r\n 把物理视图推回底部）——
+      // 改用屏幕定位的 overlay tooltip（合成在视口内，不碰内容末尾行，不会 snap）。
+      if (hasHover) {
+        const m = messages[hoverIndex];
+        previewLines = [
+          `⏱ ${fmtTime(m.timestamp)} · 第 ${hoverIndex + 1} 次发送`,
+          preview(m.text, 44),
+        ];
+      } else {
+        previewLines = undefined;
+      }
+      dotsTui?.requestRender?.();
     }
-    return parts.join("\n").trim();
-  }
-
-  function copyToClipboard(text: string): void {
-    try {
-      const b64 = Buffer.from(text, "utf8").toString("base64");
-      dotsTui?.terminal?.write?.(`\x1b]52;c;${b64}\x07`);
-      dbg(`selection copied ${text.length} chars via OSC52`);
-      showFlash(`已复制 ${text.length} 字符`);
-    } catch { /* */ }
-  }
-
-  function endSelection(): void {
-    if (!selecting) return;
-    selecting = false;
-    const a = selAnchor;
-    const c = selCurrent;
-    selAnchor = undefined;
-    selCurrent = undefined;
-    if (a && c && (a.row !== c.row || a.col !== c.col)) {
-      const text = extractSelection(a, c);
-      if (text) copyToClipboard(text);
-    }
-    // 强制重绘一次，清除屏幕上的反色高亮
-    dotsTui?.requestRender?.(true);
-  }
-
-  /** 渲染选择高亮（反色）：渲染完成后调用，直接写终端覆盖选中区域 */
-  function renderSelection(): void {
-    if (!selecting || !selAnchor || !selCurrent) return;
-    const t = dotsTui;
-    if (!t) return;
-    const top = currentViewportTop();
-    const rows = termSize().rows;
-    const lines = t.previousLines ?? [];
-    const a = selAnchor;
-    const c = selCurrent;
-    const r1 = Math.min(a.row, c.row);
-    const r2 = Math.max(a.row, c.row);
-    const c1 = a.row <= c.row ? a.col : c.col;
-    const c2 = a.row <= c.row ? c.col : a.col;
-    let buf = "";
-    for (let r = r1; r <= r2; r++) {
-      if (r < top || r >= top + rows) continue;
-      const screenRow = r - top + 1;
-      const line = stripAnsi(lines[r] ?? "").trimEnd();
-      const seg = sliceByVisibleCols(line, c1, c2);
-      if (!seg) continue;
-      const startCol = visibleWidthOf(sliceByVisibleCols(line, 0, c1)) + 1;
-      buf += `\x1b[${screenRow};${startCol}H\x1b[7m${seg}\x1b[27m`;
-    }
-    if (buf) t.terminal?.write?.(buf);
   }
 
   function handleMouse(data: string): { consume?: boolean } | undefined {
@@ -1353,19 +1064,8 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       return { consume: true };
     }
 
-    // ---- 内容区文字选择（左键按下拖动；捕获型 overlay（设置选择器等）打开时不拦截） ----
-    if (selecting) {
-      if (isMove) { updateSelection(mouse.x, mouse.y); return { consume: true }; }
-      if (btn === 0 && !mouse.press) { endSelection(); return { consume: true }; }
-      if (isWheel || btn === 1 || btn === 2) cancelSelection(); // 取消选择后继续处理
-    } else if (btn === 0 && mouse.press && !inDotsRegion(mouse.x, mouse.y) && mouse.x !== termSize().columns && !hasCapturingOverlay()) {
-      beginSelection(mouse.x, mouse.y);
-      return { consume: true };
-    }
-
     if (!inDotsRegion(mouse.x, mouse.y)) {
-      // 点列区域外：清除悬停；滚轮滚动对话区；其余事件放行
-      // （/settings 等 UI 需要鼠标事件，全部 consume 会导致它们无法点击）
+      // 点列区域外
       if ((isMove || (btn === 0 && mouse.press)) && hoverIndex !== -1) {
         hoverIndex = -1; updateHoverPreview(); dotsTui?.requestRender?.();
       }
@@ -1374,7 +1074,7 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
         scrollTranscript(btn === 0 ? -3 : 3);
         return { consume: true };
       }
-      return undefined;
+      return { consume: true };
     }
 
     // ---- 点列区域内 ----
@@ -1410,7 +1110,7 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       const columns = tui.terminal?.columns ?? process.stdout?.columns ?? 80;
       cachedSize = { rows, columns };
       enableMouse(tui);
-      // 悬停预览 overlay（屏幕底部，与 fullscreen 的 widget 同位置；更新不触发视口 snap）。
+      // 非底部悬停预览 overlay（tooltip，屏幕定位，更新不触发视口 snap）。
       // 延迟创建：init 本身在 ui.custom factory 里执行，嵌套创建 overlay 不安全。
       if (!previewOverlayCreated) {
         previewOverlayCreated = true;
@@ -1427,44 +1127,15 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
             }), {
               overlay: true,
               overlayOptions: {
-                anchor: "bottom-center",
-                width: "70%",
+                anchor: "right-center",
+                offsetX: -4,
+                width: 48,
                 maxHeight: 2,
-                offsetY: -3,
                 nonCapturing: true,
-                __cmPersistent: true,
               },
             });
-          } catch { /* 预览 overlay 创建失败不影响核心功能 */ }
+          } catch { /* tooltip 创建失败不影响核心功能 */ }
         }, 300);
-      }
-      // 跳转 flash overlay（屏幕右上角，与 fullscreen 的 flash 一致）
-      if (!flashOverlayCreated) {
-        flashOverlayCreated = true;
-        setTimeout(() => {
-          try {
-            ctx.ui.custom((_t, theme2) => ({
-              render: (w: number) => {
-                const lines = flashLines;
-                if (!lines || lines.length === 0) return [];
-                return lines.map((l) => theme2.fg("accent", theme2.bold(l)));
-              },
-              invalidate: () => {},
-              handleInput: () => {},
-            }), {
-              overlay: true,
-              overlayOptions: {
-                anchor: "top-right",
-                width: 60,
-                maxHeight: 1,
-                offsetX: -1,
-                offsetY: 1,
-                nonCapturing: true,
-                __cmPersistent: true,
-              },
-            });
-          } catch { /* flash overlay 创建失败不影响核心功能 */ }
-        }, 350);
       }
       return {
         render: (w: number) => renderDots(w, theme),
@@ -1495,19 +1166,6 @@ export default function (pi: ExtensionAPI) {
   let handler: ReturnType<typeof createFullscreenHandler> | ReturnType<typeof createRegularHandler>;
   let sessionCtx: ExtensionContext | undefined;
   let patchProblem: string | undefined;
-
-  // [chat-marks-debug] 临时:捕获未处理异常到日志文件(定位切换崩溃)
-  try {
-    const { writeFileSync: cmWfs } = require("node:fs") as typeof import("node:fs");
-    const { tmpdir: cmTmp } = require("node:os") as typeof import("node:os");
-    const { join: cmJoin } = require("node:path") as typeof import("node:path");
-    process.on("uncaughtException", (e) => {
-      try { cmWfs(cmJoin(cmTmp(), "chat-marks-crash.log"), `[${new Date().toISOString()}] ${e?.stack ?? e}\n`, { flag: "a" }); } catch { /* */ }
-    });
-    process.on("unhandledRejection", (e) => {
-      try { cmWfs(cmJoin(cmTmp(), "chat-marks-crash.log"), `[${new Date().toISOString()}] REJECTION ${e}\n`, { flag: "a" }); } catch { /* */ }
-    });
-  } catch { /* */ }
 
   const debug = process.env.CHAT_MARKS_DEBUG === "1";
   const log = debug ? (msg: string) => console.log(msg) : () => {};
@@ -1571,8 +1229,31 @@ export default function (pi: ExtensionAPI) {
 
   // ---- 事件 ----
 
-  /** 创建点列 overlay + 对应模式 handler（session_start 与 TUI 切换后重建共用） */
-  function setupOverlays(ctx: ExtensionContext) {
+  pi.on("session_start", async (_event, ctx) => {
+    if (patchProblem && ctx.hasUI && ctx.mode === "tui") {
+      ctx.ui.notify("[chat-marks] ⚠️ " + patchProblem, "warning");
+    }
+
+    messages = [];
+    sessionCtx = ctx;
+    if (!ctx.hasUI || ctx.mode !== "tui") return;
+
+    // 渲染钩子（PATCH6 renderNow + PATCH4/5 scroll-view 共用；regular 由扩展控制视图）
+    (globalThis as Record<string, unknown>)["__piScrollHook"] = (t?: unknown) => {
+      handler?.updateViewportIndicator?.(t);
+    };
+
+    // 读取历史消息
+    try {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (entry.type === "message" && entry.message?.role === "user") {
+          const text = extractText(entry.message.content);
+          if (text) messages.push({ id: entry.id, timestamp: entry.message.timestamp ?? Date.now(), text });
+        }
+      }
+    } catch { /* */ }
+
+    // 路由：检测模式，创建对应 handler
     void ctx.ui.custom((tui, theme) => {
       if (isFullscreenTui(tui as TuiInstance)) {
         // ---- fullscreen 模式：完整功能 ----
@@ -1595,48 +1276,8 @@ export default function (pi: ExtensionAPI) {
         width: 2,
         maxHeight: "90%",
         nonCapturing: true,
-        // 常驻标记：pi 的 switchTuiMode 检查会忽略带此标记的 overlay
-        __cmPersistent: true,
       },
     });
-  }
-
-  pi.on("session_start", async (_event, ctx) => {
-    if (patchProblem && ctx.hasUI && ctx.mode === "tui") {
-      ctx.ui.notify("[chat-marks] ⚠️ " + patchProblem, "warning");
-    }
-
-    messages = [];
-    sessionCtx = ctx;
-    if (!ctx.hasUI || ctx.mode !== "tui") return;
-
-    // 渲染钩子（PATCH6 renderNow + PATCH4/5 scroll-view 共用；regular 由扩展控制视图）
-    (globalThis as Record<string, unknown>)["__piScrollHook"] = (t?: unknown) => {
-      handler?.updateViewportIndicator?.(t);
-    };
-
-    // TUI mode 切换完成（interactive-mode.js 补丁 __piAfterTuiSwitch 调用）：
-    // 旧 TUI 已销毁、新 TUI 已 start —— 清理旧 handler，延迟重建常驻 overlay。
-    (globalThis as Record<string, unknown>)["__piAfterTuiSwitch"] = () => {
-      handler?.cleanup?.();
-      handler = undefined;
-      const c = sessionCtx;
-      if (c) setTimeout(() => setupOverlays(c), 150);
-    };
-
-    // 读取历史消息
-    try {
-      for (const entry of ctx.sessionManager.getEntries()) {
-        if (entry.type === "message" && entry.message?.role === "user") {
-          const text = extractText(entry.message.content);
-          if (text) messages.push({ id: entry.id, timestamp: entry.message.timestamp ?? Date.now(), text });
-        }
-      }
-    } catch { /* */ }
-
-    // 创建点列 overlay + handler（TUI 切换后也会调用重建；__cmPersistent 标记让
-    // /settings 切 TUI mode 时不被 pi 的 hasOverlayEntries 检查阻止）
-    setupOverlays(ctx);
 
     // 等布局完成后滚到底部 + 同步视口
     setTimeout(() => {
@@ -1661,7 +1302,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     handler?.cleanup?.();
     (globalThis as Record<string, unknown>)["__piScrollHook"] = undefined;
-    (globalThis as Record<string, unknown>)["__piAfterTuiSwitch"] = undefined;
     sessionCtx = undefined;
   });
 
