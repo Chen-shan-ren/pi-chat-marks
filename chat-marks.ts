@@ -28,12 +28,17 @@
  *   v5  regular 模式尝试（DECSCROLL 方案：终端不交互 scrollback → 黑屏，弃用）
  *   v6  路由架构：fullscreen 完整功能，regular 精简功能
  *   v7  强制视口切片渲染：regular 模式功能与 fullscreen 对齐
+ *   v7.1 regular 预览/跳转提示位置与 fullscreen 统一：悬停预览显示在编辑器正上方
+ *        （fullscreen 的 setWidget 渲染于 widgetContainerAbove），跳转 flash 屏幕
+ *        顶行贴右缘反色（与 AltScreenFlashContainer 合成位置一致）。
+ *        附带修复：SGR 无按键移动事件(button=32→btn&3=0)被误判为选择开始，
+ *        导致悬停移开点列时预览不清除
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, SelectList, Text, matchesKey } from "@earendil-works/pi-tui";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -71,6 +76,8 @@ interface TuiBaseLike {
   terminal?: { rows?: number; columns?: number; write?: (data: string) => void };
   requestRender?: (force?: boolean) => void;
   addInputListener?: (fn: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
+  /** 渲染全部组件得到内容行（不含 overlay 合成），与 doRender 第一步相同 */
+  render?: (width: number) => string[];
   previousLines?: string[];
   previousViewportTop?: number;
   hardwareCursorRow?: number;
@@ -132,13 +139,24 @@ function parseSgrMouse(data: string): SgrMouse | null {
 function matchesPromptRow(visible: string, targetText: string): boolean {
   if (!visible) return false;
   if (targetText.length <= visible.length) return visible === targetText;
-  return visible.length >= 4 && targetText.startsWith(visible);
+  // 前缀匹配门槛 2 字符：覆盖长消息换行后首行很短的情况（如"这是令牌"）；
+  // 过低的门槛（1 字符）易误吞后续消息，顺序游标下会造成连锁错位
+  return visible.length >= 2 && targetText.startsWith(visible);
 }
 
-/** 去掉行尾 2 列：点列 overlay（含 TRANSPARENT_MARK + " ●"）会合成到内容行尾部，
- * 文本匹配前必须剥掉，否则标记行被点列字符污染导致匹配失败（跳转定位不到消息）。 */
+/** 点列合成到内容行尾部时的字符（renderDots 的四种状态字形） */
+const DOT_GLYPHS = "•●◉⬤";
+
+/** 去掉行尾的点列合成后缀：仅当行尾确为"空格+点字形"（点列 2 列）时才剥除。
+ * 不能无条件砍 2 字符——干净内容行（如短消息"需要"、"我发布了"、换行首行"这是令牌"）
+ * 被砍后会截断甚至变空，导致行映射匹配失败（跳转时"未能定位到该消息"）。 */
 function stripDotsRegion(s: string): string {
-  return s.slice(0, Math.max(0, s.length - 2));
+  let end = s.length;
+  if (end > 0 && DOT_GLYPHS.includes(s[end - 1])) {
+    end -= 1;
+    if (end > 0 && s[end - 1] === " ") end -= 1;
+  }
+  return s.slice(0, end);
 }
 
 function buildRowMap(lines: string[], messages: UserMsg[]): Map<number, number> {
@@ -851,12 +869,34 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
   // 跳转钉住的指示索引：jumpToMessage 设置，渲染完成后由 updateViewportIndicator 消费一次。
   // 视口顶行被 clamp（消息太靠底无法居中）时，中线扫描会指到上一条消息，钉住保证 ◉ 指目标。
   let pinnedViewportIndex = -1;
-  // 悬停预览（overlay 内容：屏幕底部显示，与 fullscreen 的 widget 同位置；底部/非底部统一）
+  // 悬停预览：与 fullscreen 统一——显示在编辑器正上方（fullscreen 的 setWidget 渲染于
+  // widgetContainerAbove，紧贴编辑器上方、左对齐、默认前景色、Text paddingX=1）。
+  // regular 模式 widget 不可用（渲染于内容末尾，更新触发差分渲染视口 snap，行数变化
+  // 残留黑行），改用底部锚点 overlay + 动态 offsetY 模拟相同位置。
   let previewLines: string[] | undefined;
   let previewOverlayCreated = false;
-  // 跳转 flash（屏幕右上角，与 fullscreen 一致）
+  let previewLine1: Text | undefined;
+  let previewLine2: Text | undefined;
+  // overlay options 以引用保存：compositeOverlays 每次渲染实时读取 entry.options，
+  // 修改属性即可动态调整位置/宽度（编辑器增高、终端尺寸变化时跟随）
+  const previewOptions = {
+    anchor: "bottom-left" as const,
+    width: undefined as number | undefined,
+    offsetY: 0,
+    nonCapturing: true,
+    __cmPersistent: true,
+  };
+  // 跳转 flash：与 fullscreen 统一——屏幕顶行、贴右缘、反色、两侧各 1 空格填充
+  // （fullscreen 的 AltScreenFlashContainer 在 row 0 以 width - flashWidth 右对齐合成）
   let flashLines: string[] | undefined;
   let flashOverlayCreated = false;
+  const flashOptions = {
+    anchor: "top-right" as const,
+    width: 1,
+    maxHeight: 1,
+    nonCapturing: true,
+    __cmPersistent: true,
+  };
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   // 内容区文字选择（左键按下拖动；释放时提取文本 + OSC52 复制）
   let selecting = false;
@@ -996,23 +1036,75 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     setViewport(target);
   }
 
+  /** [chat-marks-diag] 跳转失败时转储现场到 %TEMP%\chat-marks-jump-fail.jsonl（定位后移除） */
+  function dumpJumpFailure(info: Record<string, unknown>): void {
+    try {
+      appendFileSync(join(tmpdir(), "chat-marks-jump-fail.jsonl"), JSON.stringify({ ts: new Date().toISOString(), ...info }) + "\n");
+    } catch { /* */ }
+  }
+
+  function dumpMapDetail(index: number, lines: string[], map: Map<number, number>): Record<string, unknown> {
+    const markerRows: Array<[number, number]> = [];
+    for (const [row, msgIdx] of map) markerRows.push([row, msgIdx]);
+    const markerVisibles: Array<{ row: number; vis: string }> = [];
+    for (let row = 0; row < lines.length; row++) {
+      if (OSC133_PROMPT_START.test(lines[row] ?? "")) {
+        let vis = stripDotsRegion(stripAnsi(lines[row] ?? "")).trim();
+        if (!vis) {
+          for (let r2 = row + 1; r2 < lines.length; r2++) {
+            if (OSC133_PROMPT_START.test(lines[r2] ?? "")) break;
+            vis = stripDotsRegion(stripAnsi(lines[r2] ?? "")).trim();
+            if (vis) break;
+          }
+        }
+        markerVisibles.push({ row, vis: vis.slice(0, 60) });
+      }
+    }
+    return {
+      index,
+      targetText: messages[index]?.text?.trim()?.slice(0, 120),
+      messagesLen: messages.length,
+      term: termSize(),
+      scrollOffset,
+      viewportIndex,
+      viewportTop: currentViewportTop(),
+      linesLen: lines.length,
+      mapSize: map.size,
+      map: markerRows,
+      markerVisibles,
+      msgs: messages.map((m, i) => [i, m.text.trim().slice(0, 80)]),
+    };
+  }
+
   /** 跳转到第 index 条用户消息（视图居中） */
   function jumpToMessage(index: number): boolean {
     const t = dotsTui;
     const target = messages[index];
-    if (!t || !target) return false;
-    const lines = t.previousLines ?? [];
-    if (lines.length === 0) return false;
+    if (!t || !target) {
+      dumpJumpFailure({ kind: "fail-early", index, reason: !t ? "no-tui" : "no-target", messagesLen: messages.length });
+      return false;
+    }
+    // overlay（/marks 列表、悬停预览等）打开时，普通渲染路径会把 overlay 文本合成进
+    // previousLines（视口在顶部时会覆盖最早几条消息的标记行），导致行映射失败。
+    // 现场重新渲染全部组件取干净内容行（与 doRender 第一步相同，不含 overlay 合成）。
+    let lines: string[] = [];
+    try {
+      const fresh = t.render?.(termSize().columns);
+      if (Array.isArray(fresh) && fresh.length > 0) lines = fresh;
+    } catch { /* 渲染异常时回退 previousLines */ }
+    if (lines.length === 0) lines = t.previousLines ?? [];
+    if (lines.length === 0) {
+      dumpJumpFailure({ kind: "fail-early", index, reason: "no-lines", messagesLen: messages.length });
+      return false;
+    }
     const map = getRowMap(lines);
     let matchRow = -1;
     for (const [row, msgIdx] of map) {
       if (msgIdx === index) { matchRow = row; break; }
     }
     if (matchRow < 0) {
-      const markers = lines.map((l, i) => OSC133_PROMPT_START.test(l || "") ? `${i}:"${stripAnsi(l || "").slice(0, 28)}"` : "").filter(Boolean).join(" ; ");
-      const l51 = stripAnsi(lines[51] || "");
-      const l52 = stripAnsi(lines[52] || "");
-      dbg(`jumpToMessage idx=${index} FAILED lines=${lines.length} mapSize=${map.size} map=[${[...map.entries()].map(([r, i]) => `${r}:${i}`).join(",")}] markers=[${markers}] l51len=${l51.length} l51=${JSON.stringify(l51)} l52len=${l52.length} l52=${JSON.stringify(l52)} l52trim=${JSON.stringify(stripDotsRegion(l52).trim())}`);
+      dbg(`jumpToMessage idx=${index} FAILED lines=${lines.length} msgs=${messages.length} mapSize=${map.size}`);
+      dumpJumpFailure({ kind: "fail", ...dumpMapDetail(index, lines, map) });
       return false;
     }
     const rows = termSize().rows;
@@ -1114,7 +1206,7 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
         }
       }
       next = markRow >= 0 ? (map.get(markRow) ?? -1) : -1;
-      dbg(`viewport indicator: scan mid=${mid} markRow=${markRow} -> ${next} l51marker=${OSC133_PROMPT_START.test(lines[51] || "")} mapHas51=${map.has(51)} l52=${JSON.stringify(stripDotsRegion(stripAnsi(lines[52] || "")).trim().slice(0, 20))}`);
+      dbg(`viewport indicator: scan mid=${mid} markRow=${markRow} -> ${next}`);
     }
     if (next !== viewportIndex) {
       viewportIndex = next;
@@ -1165,9 +1257,13 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     return currentViewportTop() >= maxTop;
   }
 
-  /** 右上角 flash（regular 无内置 flash，用 overlay 模拟；与 fullscreen 的 flash 视觉一致） */
+  /** 顶行贴右缘反色 flash：与 fullscreen 的 AltScreenFlashContainer 完全一致。
+   * fullscreen 把 ` msg `（反色）在 row 0 以 col = width - flashWidth 合成；regular 无
+   * 内置 flash，用 overlay 模拟：宽度动态设为文本可见宽度，top-right 锚点盒子即贴右缘。 */
   function showFlash(msg: string, ms = 1500): void {
-    flashLines = [msg];
+    const line = ` ${msg} `;
+    flashLines = [`\x1b[7m${line}\x1b[27m`];
+    flashOptions.width = Math.max(1, visibleWidthOf(line));
     if (flashTimer) clearTimeout(flashTimer);
     flashTimer = setTimeout(() => {
       flashLines = undefined;
@@ -1176,12 +1272,54 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     dotsTui?.requestRender?.();
   }
 
+  /** 探测渲染 children[idx] 的高度（行）。interactive-mode.mountInteractiveTui 挂载顺序：
+   * [document, pendingMessages, status, widgetAbove(3), editor(4), widgetBelow(5), footer(6)]。
+   * 失败回退 fallback。编辑器随多行输入增高、footer 随扩展状态行增多，预览需跟随上移
+   * （fullscreen 由布局自动完成）。 */
+  function childHeight(idx: number, fallback: number): number {
+    try {
+      const t = dotsTui as unknown as { children?: Array<{ render?: (w: number) => string[] }> };
+      const child = t.children?.[idx];
+      const lines = child?.render?.(termSize().columns);
+      if (Array.isArray(lines) && lines.length > 0) return lines.length;
+    } catch { /* 回退默认值 */ }
+    return fallback;
+  }
+
+  /** 刷新预览 overlay 位置（compositeOverlays 实时读取 options，渲染前调用即可生效）：
+   * 编辑器可见时，overlay 底行落在编辑器顶边框正上方（与 fullscreen widget 同位：
+   * fullscreen 的预览渲染在 widgetContainerAbove，占据 editor 正上方的行）；
+   * 向上滚动编辑器不在视口时，贴屏幕底部（fullscreen 中编辑器恒在底部，此为最近似）。 */
+  function refreshPreviewPosition(height: number): void {
+    const { rows, columns } = termSize();
+    // 让出右侧 2 列点列区（1-based 列 [columns-1, columns]）：overlay 合成按行替换，
+    // 预览比点列后创建（focusOrder 更大，合成在上层），全宽会盖住同行的点——编辑器多行
+    // 草稿/footer 状态行增高时预览底行上浮进入点列区，悬停末尾消息的点会被预览遮住。
+    // compositeTuiLine 保留 base 行超出 overlay 宽度的 after 段，收窄 2 列即可让点可见
+    // （与 fullscreen 观感一致：那里预览是基础内容、点列后合成，点恒可见）。
+    previewOptions.width = Math.max(1, columns - 2);
+    const contentLen = dotsTui?.previousLines?.length ?? 0;
+    const top = currentViewportTop();
+    if (contentLen === 0 || top + rows < contentLen) {
+      previewOptions.offsetY = 0;
+      return;
+    }
+    // 内容行自底向上：footer(2：cwd+stats；扩展状态行存在时更多) → widgetBelow(通常 0)
+    // → editor(3，多行输入时更高) → widgetAbove(空时 Spacer(1))。
+    // 预览底行目标 = 编辑器顶边框的上一行（editorTop - 1）
+    const editorH = childHeight(4, 3);
+    const footerH = childHeight(6, 2);
+    const viewportStart = Math.max(0, contentLen - rows);
+    const row = Math.max(0, contentLen - footerH - editorH - height - viewportStart);
+    previewOptions.offsetY = row - (rows - height);
+  }
+
   function updateHoverPreview() {
     const hasHover = hoverIndex >= 0 && hoverIndex < messages.length;
     dbg(`updateHoverPreview hover=${hoverIndex} bottom=${isViewportAtBottom()} previewLines=${previewLines?.length ?? 0}->${hasHover ? 2 : 0}`);
-    // 统一用屏幕底部 overlay 预览（与 fullscreen 的 widget 同位置）：
-    // widget 在 regular 模式下渲染于内容末尾，更新/清除都会触发差分渲染滚动视口（snap）
-    // 且 2 行↔1 行重排会残留黑行 —— overlay 屏幕定位、行数固定，两者都不存在。
+    // 与 fullscreen 统一：预览显示在编辑器正上方（fullscreen 由 setWidget 渲染于
+    // widgetContainerAbove）。regular 的 widget 渲染于内容末尾，更新/清除都会触发差分
+    // 渲染滚动视口（snap），且行数变化会残留黑行，故用 overlay 模拟相同位置。
     if (hasHover) {
       const m = messages[hoverIndex];
       previewLines = [
@@ -1191,6 +1329,9 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     } else {
       previewLines = undefined;
     }
+    previewLine1?.setText(previewLines?.[0] ?? "");
+    previewLine2?.setText(previewLines?.[1] ?? "");
+    if (previewLines) refreshPreviewPosition(previewLines.length);
     dotsTui?.requestRender?.();
   }
 
@@ -1397,8 +1538,10 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       if (isMove) { updateSelection(mouse.x, mouse.y); return { consume: true }; }
       if (btn === 0 && !mouse.press) { endSelection(); return { consume: true }; }
       if (isWheel || btn === 1 || btn === 2) cancelSelection(); // 取消选择后继续处理
-    } else if (btn === 0 && !isWheel && mouse.press && !inDotsRegion(mouse.x, mouse.y) && mouse.x !== termSize().columns && !hasCapturingOverlay()) {
-      // 滚轮按钮 64/65 的 btn(=button&3)也是 0,必须排除 isWheel,否则上滑被误判为选择开始
+    } else if (btn === 0 && !isWheel && !isMove && mouse.press && !inDotsRegion(mouse.x, mouse.y) && mouse.x !== termSize().columns && !hasCapturingOverlay()) {
+      // 滚轮按钮 64/65 的 btn(=button&3)也是 0,必须排除 isWheel,否则上滑被误判为选择开始;
+      // SGR 移动事件(无按键)button=32 → btn 也是 0 且 press=true,必须排除 isMove,
+      // 否则悬停移开点列被误判为选择开始,跳过下方 hover 清除分支(预览不消失)
       beginSelection(mouse.x, mouse.y);
       return { consume: true };
     }
@@ -1450,59 +1593,54 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       const columns = tui.terminal?.columns ?? process.stdout?.columns ?? 80;
       cachedSize = { rows, columns };
       enableMouse(tui);
-      // 悬停预览 overlay（屏幕底部，与 fullscreen 的 widget 同位置；更新不触发视口 snap）。
+      // 悬停预览 overlay（与 fullscreen 的 widget 同位置：编辑器正上方、左对齐、默认前景色）。
       // 延迟创建：init 本身在 ui.custom factory 里执行，嵌套创建 overlay 不安全。
       if (!previewOverlayCreated) {
         previewOverlayCreated = true;
         setTimeout(() => {
           try {
-            ctx.ui.custom((_t, theme2) => ({
-              render: (w: number) => {
-                const lines = previewLines;
-                if (!lines || lines.length === 0) return [];
-                // 首行用 accent(高亮),次行用 description(次要)
-                return lines.map((l, i) => i === 0
-                  ? theme2.fg("accent", l)
-                  : theme2.fg("muted", l));
-              },
-              invalidate: () => {},
-              handleInput: () => {},
-            }), {
+            ctx.ui.custom((_t, _theme2) => {
+              // 与 fullscreen widget 相同的渲染方式：Text(line, paddingX=1, paddingY=0)，无着色
+              const container = new Container();
+              previewLine1 = new Text("", 1, 0);
+              previewLine2 = new Text("", 1, 0);
+              container.addChild(previewLine1);
+              container.addChild(previewLine2);
+              return {
+                render: (w: number) => {
+                  if (!previewLines || previewLines.length === 0) return [];
+                  const lines = container.render(w);
+                  // 编辑器高度/视口状态可能在两次悬停之间变化（多行输入、滚动），
+                  // 每次合成前刷新位置（row 在本次 render 之后解析，当场生效）
+                  refreshPreviewPosition(lines.length);
+                  return lines;
+                },
+                invalidate: () => container.invalidate(),
+                handleInput: () => {},
+              };
+            }, {
               overlay: true,
-              overlayOptions: {
-                anchor: "right-center",
-                width: 48,
-                maxHeight: 2,
-                offsetX: -4,
-                nonCapturing: true,
-                __cmPersistent: true,
-              },
+              overlayOptions: previewOptions,
             });
           } catch { /* 预览 overlay 创建失败不影响核心功能 */ }
         }, 300);
       }
-      // 跳转 flash overlay（屏幕右上角，与 fullscreen 的 flash 一致）
+      // 跳转 flash overlay（与 fullscreen 的 flash 一致：顶行、贴右缘、反色）
       if (!flashOverlayCreated) {
         flashOverlayCreated = true;
         setTimeout(() => {
           try {
-            ctx.ui.custom((_t, theme2) => ({
-              render: (w: number) => {
+            ctx.ui.custom((_t, _theme2) => ({
+              render: (_w: number) => {
                 const lines = flashLines;
                 if (!lines || lines.length === 0) return [];
-                return lines.map((l) => theme2.fg("accent", theme2.bold(l)));
+                return lines;
               },
               invalidate: () => {},
               handleInput: () => {},
             }), {
               overlay: true,
-              overlayOptions: {
-                anchor: "top-right",
-                width: 60,
-                maxHeight: 1,
-                nonCapturing: true,
-                __cmPersistent: true,
-              },
+              overlayOptions: flashOptions,
             });
           } catch { /* flash overlay 创建失败不影响核心功能 */ }
         }, 350);
@@ -1536,19 +1674,6 @@ export default function (pi: ExtensionAPI) {
   let handler: ReturnType<typeof createFullscreenHandler> | ReturnType<typeof createRegularHandler>;
   let sessionCtx: ExtensionContext | undefined;
   let patchProblem: string | undefined;
-
-  // [chat-marks-debug] 临时:捕获未处理异常到日志文件(定位切换崩溃)
-  try {
-    const { writeFileSync: cmWfs } = require("node:fs") as typeof import("node:fs");
-    const { tmpdir: cmTmp } = require("node:os") as typeof import("node:os");
-    const { join: cmJoin } = require("node:path") as typeof import("node:path");
-    process.on("uncaughtException", (e) => {
-      try { cmWfs(cmJoin(cmTmp(), "chat-marks-crash.log"), `[${new Date().toISOString()}] ${e?.stack ?? e}\n`, { flag: "a" }); } catch { /* */ }
-    });
-    process.on("unhandledRejection", (e) => {
-      try { cmWfs(cmJoin(cmTmp(), "chat-marks-crash.log"), `[${new Date().toISOString()}] REJECTION ${e}\n`, { flag: "a" }); } catch { /* */ }
-    });
-  } catch { /* */ }
 
   const debug = process.env.CHAT_MARKS_DEBUG === "1";
   const log = debug ? (msg: string) => console.log(msg) : () => {};
@@ -1667,7 +1792,31 @@ export default function (pi: ExtensionAPI) {
 
     // 读取历史消息
     try {
-      for (const entry of ctx.sessionManager.getEntries()) {
+      const entries = ctx.sessionManager.getEntries();
+      // 会话压缩（compaction）：渲染内容只保留最后一次压缩 firstKeptEntryId 起的条目，
+      // 之前的消息被摘要块取代。点列若计入被压缩的消息，其标记行已不存在，点击必报
+      // "未能在对话区定位到该消息"——因此只统计保留区内的用户消息。
+      let lastCompactIdx = -1;
+      let keptFromId: string | undefined;
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i] as { type?: string; firstKeptEntryId?: string };
+        if (e.type === "compaction") {
+          lastCompactIdx = i;
+          keptFromId = typeof e.firstKeptEntryId === "string" && e.firstKeptEntryId !== ""
+            ? e.firstKeptEntryId
+            : undefined;
+        }
+      }
+      let kept = lastCompactIdx < 0; // 无压缩：全部统计
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (!kept) {
+          const reachedBoundary = keptFromId !== undefined
+            ? entry.id === keptFromId
+            : i === lastCompactIdx;
+          if (reachedBoundary) kept = true;
+          else continue;
+        }
         if (entry.type === "message" && entry.message?.role === "user") {
           const text = extractText(entry.message.content);
           if (text) messages.push({ id: entry.id, timestamp: entry.message.timestamp ?? Date.now(), text });
