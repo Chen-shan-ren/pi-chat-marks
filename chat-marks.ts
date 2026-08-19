@@ -1460,17 +1460,20 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
               render: (w: number) => {
                 const lines = previewLines;
                 if (!lines || lines.length === 0) return [];
-                return lines.map((l) => theme2.fg("muted", l));
+                // 首行用 accent(高亮),次行用 description(次要)
+                return lines.map((l, i) => i === 0
+                  ? theme2.fg("accent", l)
+                  : theme2.description(l));
               },
               invalidate: () => {},
               handleInput: () => {},
             }), {
               overlay: true,
               overlayOptions: {
-                anchor: "bottom-left",
-                width: "100%",
+                anchor: "right-center",
+                width: 48,
                 maxHeight: 2,
-                offsetY: -2,
+                offsetX: -4,
                 nonCapturing: true,
                 __cmPersistent: true,
               },
@@ -1494,10 +1497,9 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
             }), {
               overlay: true,
               overlayOptions: {
-                anchor: "top-center",
-                width: "80%",
+                anchor: "top-right",
+                width: 60,
                 maxHeight: 1,
-                offsetY: 0,
                 nonCapturing: true,
                 __cmPersistent: true,
               },
