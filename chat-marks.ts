@@ -868,6 +868,9 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
   let scrollbarDrag: { startY: number; startTop: number } | undefined;
   // 内容行数记账：检测新消息追加（追加时解除强制视口回底部，否则新内容不可见）
   let lastContentLen = 0;
+  // 用户主动滚动标志：用户通过滚轮/跳转离开底部后，模型输出时不自动跟随回底部
+  // （fullscreen 的 ScrollView 有类似逻辑：用户手动滚动后停止 follow-tail）
+  let userScrolled = false;
 
   const dbg = (msg: string) => {
     if (process.env.CHAT_MARKS_DEBUG !== "1") return;
@@ -973,6 +976,10 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     g["__piViewportTop"] = target;
     scrollbarUnknown = false;
     scrollbarDrag = undefined;
+    // 用户主动滚动（滚轮/跳转）：标记离开底部，模型输出时不自动跟随
+    if (target < maxTop) {
+      userScrolled = true;
+    }
     t.requestRender?.(true);
   }
 
@@ -1054,16 +1061,24 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     const tui = (t ?? dotsTui) as typeof dotsTui | undefined;
     if (!tui) return;
     const lines = tui.previousLines ?? [];
-    // 新消息追加（内容变长）时：解除强制视口回到底部显示新内容。
-    // 非底部时所有渲染都走切片（见 PATCH9），不检测的话追加的消息永远不可见。
+    // 检测视口是否在最底部：如果在底部，清除用户滚动标志（恢复跟随模式）
+    const top = currentViewportTop();
+    const rows = termSize().rows;
+    const maxTop = Math.max(0, lines.length - rows);
+    if (lines.length > 0 && (g["__piViewportTop"] === undefined || top >= maxTop)) {
+      userScrolled = false;
+    }
+    // 新消息追加（内容变长）时：如果用户没有主动离开底部，解除强制视口回到底部显示新内容。
+    // 如果用户已手动滚动（userScrolled=true），保持当前视口不跟随。
+    // 非底部时所有渲染都走切片（见 PATCH9），不检测的话追加的消息永远不可见（用户在底部时）。
     if (lines.length > lastContentLen) {
       lastContentLen = lines.length;
-      if (g["__piViewportTop"] !== undefined || g["__piForcedViewportTop"] !== undefined) {
+      if (!userScrolled && (g["__piViewportTop"] !== undefined || g["__piForcedViewportTop"] !== undefined)) {
         g["__piViewportTop"] = undefined;
         g["__piForcedViewportTop"] = undefined;
         pinnedViewportIndex = -1;
         cancelSelection();
-        dbg(`content appended (${lines.length}): releasing forced viewport`);
+        dbg(`content appended (${lines.length}): releasing forced viewport (following tail)`);
         tui.requestRender?.();
       }
     } else if (lines.length < lastContentLen) {
@@ -1081,10 +1096,7 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       // 视图回到底部后恢复悬停预览 widget
       if (hoverIndex >= 0) updateHoverPreview();
     }
-    const top = currentViewportTop();
-    const rows = termSize().rows;
-    const bottom = top + rows - 1;
-    if ((tui.hardwareCursorRow ?? 0) > bottom) tui.hardwareCursorRow = bottom;
+    if ((tui.hardwareCursorRow ?? 0) > top + rows - 1) tui.hardwareCursorRow = top + rows - 1;
     if (lines.length === 0) return;
     let next = -1;
     if (pinnedViewportIndex >= 0) {
@@ -1455,10 +1467,10 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
             }), {
               overlay: true,
               overlayOptions: {
-                anchor: "bottom-center",
-                width: "70%",
+                anchor: "bottom-left",
+                width: "100%",
                 maxHeight: 2,
-                offsetY: -3,
+                offsetY: -2,
                 nonCapturing: true,
                 __cmPersistent: true,
               },
@@ -1482,11 +1494,10 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
             }), {
               overlay: true,
               overlayOptions: {
-                anchor: "top-right",
-                width: 60,
+                anchor: "top-center",
+                width: "80%",
                 maxHeight: 1,
-                offsetX: -1,
-                offsetY: 1,
+                offsetY: 0,
                 nonCapturing: true,
                 __cmPersistent: true,
               },
