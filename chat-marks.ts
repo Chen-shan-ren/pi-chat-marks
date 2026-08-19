@@ -324,7 +324,7 @@ const PATCH9_INSERT =
   "                buffer += \"\\x1b[2J\\x1b[H\\x1b[3J\"; // Clear screen, home, then clear scrollback\n" +
   "            }\n" +
   "            // [chat-marks-patch] __piForcedSlice: forced viewport slice render (chat-marks regular mode)\n" +
-  "            const __piForcedTop = globalThis.__piForcedViewportTop;\n" +
+  "            const __piForcedTop = globalThis.__piForcedViewportTop ?? globalThis.__piViewportTop;\n" +
   "            if (__piForcedTop !== undefined) {\n" +
   "                globalThis.__piForcedViewportTop = undefined;\n" +
   "                if (!newLines.some((l) => typeof l === \"string\" && isImageLine(l))) {\n" +
@@ -808,6 +808,13 @@ function createFullscreenHandler(messages: UserMsg[], ctx: ExtensionContext) {
       (globalThis as Record<string, unknown>)["__piMouseHook"] = (data: string, t: unknown) =>
         handleMouse(data, t as TuiFullscreenLike);
 
+      // 确保终端鼠标追踪开启：TUI 切换时 regular 的 cleanup(disableMouse 写 1003l)在
+      // __piAfterTuiSwitch 里执行,晚于新 TUI start(1003h)——追踪被关掉后滚轮事件不再
+      // 发给 pi(变成终端原生 scrollback 滚动,表现为"滚轮变历史发送"),这里补开。
+      try {
+        tui.terminal?.write?.("\x1b[?1000h\x1b[?1003h\x1b[?1006h");
+      } catch { /* */ }
+
       return {
         render: (w: number) => renderDots(w, theme),
         invalidate: () => {},
@@ -859,6 +866,8 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
   let scrollbarUnknown = false;
   // 滚动条拖动跟踪：按下点 + 按下时视图顶行（释放时按拇指位移近似对齐）
   let scrollbarDrag: { startY: number; startTop: number } | undefined;
+  // 内容行数记账：检测新消息追加（追加时解除强制视口回底部，否则新内容不可见）
+  let lastContentLen = 0;
 
   const dbg = (msg: string) => {
     if (process.env.CHAT_MARKS_DEBUG !== "1") return;
@@ -1044,6 +1053,22 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
   function updateViewportIndicator(t?: unknown): void {
     const tui = (t ?? dotsTui) as typeof dotsTui | undefined;
     if (!tui) return;
+    const lines = tui.previousLines ?? [];
+    // 新消息追加（内容变长）时：解除强制视口回到底部显示新内容。
+    // 非底部时所有渲染都走切片（见 PATCH9），不检测的话追加的消息永远不可见。
+    if (lines.length > lastContentLen) {
+      lastContentLen = lines.length;
+      if (g["__piViewportTop"] !== undefined || g["__piForcedViewportTop"] !== undefined) {
+        g["__piViewportTop"] = undefined;
+        g["__piForcedViewportTop"] = undefined;
+        pinnedViewportIndex = -1;
+        cancelSelection();
+        dbg(`content appended (${lines.length}): releasing forced viewport`);
+        tui.requestRender?.();
+      }
+    } else if (lines.length < lastContentLen) {
+      lastContentLen = lines.length;
+    }
     const forced = g["__piViewportTop"];
     const pvt = tui.previousViewportTop ?? 0;
     if (typeof forced === "number" && pvt !== forced) {
@@ -1060,7 +1085,6 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
     const rows = termSize().rows;
     const bottom = top + rows - 1;
     if ((tui.hardwareCursorRow ?? 0) > bottom) tui.hardwareCursorRow = bottom;
-    const lines = tui.previousLines ?? [];
     if (lines.length === 0) return;
     let next = -1;
     if (pinnedViewportIndex >= 0) {
@@ -1361,7 +1385,8 @@ function createRegularHandler(messages: UserMsg[], ctx: ExtensionContext) {
       if (isMove) { updateSelection(mouse.x, mouse.y); return { consume: true }; }
       if (btn === 0 && !mouse.press) { endSelection(); return { consume: true }; }
       if (isWheel || btn === 1 || btn === 2) cancelSelection(); // 取消选择后继续处理
-    } else if (btn === 0 && mouse.press && !inDotsRegion(mouse.x, mouse.y) && mouse.x !== termSize().columns && !hasCapturingOverlay()) {
+    } else if (btn === 0 && !isWheel && mouse.press && !inDotsRegion(mouse.x, mouse.y) && mouse.x !== termSize().columns && !hasCapturingOverlay()) {
+      // 滚轮按钮 64/65 的 btn(=button&3)也是 0,必须排除 isWheel,否则上滑被误判为选择开始
       beginSelection(mouse.x, mouse.y);
       return { consume: true };
     }
